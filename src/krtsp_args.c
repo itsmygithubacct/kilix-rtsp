@@ -48,6 +48,7 @@ void krtsp_args_request_init(krtsp_args_request *request)
     request->height = 0;
     request->fps_cap = 0;
     request->low_latency = true;
+    request->letterbox = false;
     request->pixfmt = KRTSP_PIXFMT_RGBA;
     request->legacy_timeout_flag = false;
 }
@@ -201,15 +202,41 @@ size_t krtsp_build_argv(
 
     scaling = request->width > 0;
     if (scaling || request->fps_cap > 0) {
-        push_arg(&writer, "-vf");
-        if (scaling && request->fps_cap > 0) {
-            push_format(&writer, "scale=%d:%d,fps=%d",
-                        request->width, request->height, request->fps_cap);
+        char filters[192];
+        int printed;
+
+        if (scaling && request->letterbox) {
+            /* Fit inside the box, then pad back out to it.  The output is
+             * exactly width x height whatever the camera's aspect is. */
+            printed = snprintf(filters, sizeof(filters),
+                "scale=%d:%d:force_original_aspect_ratio=decrease,"
+                "pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
+                request->width, request->height,
+                request->width, request->height);
         } else if (scaling) {
-            push_format(&writer, "scale=%d:%d",
-                        request->width, request->height);
+            printed = snprintf(filters, sizeof(filters), "scale=%d:%d",
+                               request->width, request->height);
         } else {
-            push_format(&writer, "fps=%d", request->fps_cap);
+            printed = 0;
+            filters[0] = '\0';
+        }
+        if (printed < 0 || (size_t)printed >= sizeof(filters)) {
+            return 0u;
+        }
+        if (request->fps_cap > 0) {
+            char with_fps[224];
+
+            printed = snprintf(with_fps, sizeof(with_fps), "%s%sfps=%d",
+                               filters, filters[0] != '\0' ? "," : "",
+                               request->fps_cap);
+            if (printed < 0 || (size_t)printed >= sizeof(with_fps)) {
+                return 0u;
+            }
+            push_arg(&writer, "-vf");
+            push_arg(&writer, with_fps);
+        } else {
+            push_arg(&writer, "-vf");
+            push_arg(&writer, filters);
         }
     }
 

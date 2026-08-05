@@ -81,6 +81,18 @@ typedef struct krtsp_args_request {
      * and integrity matters more. */
     bool low_latency;
 
+    /*
+     * Scale to fit inside width x height preserving aspect, then pad to
+     * exactly that size with black bars.
+     *
+     * Worth doing in ffmpeg rather than afterwards: it means every frame
+     * arrives at exactly the size the presenter wants, so the read stays
+     * fixed-size and self-framing and no software scaling is needed - and
+     * it removes the need to know the camera's aspect ratio at all, which
+     * otherwise has to be probed before the first frame.
+     */
+    bool letterbox;
+
     krtsp_pixfmt pixfmt;
 
     /* ffmpeg renamed the RTSP socket timeout: -stimeout below libavformat
@@ -233,6 +245,10 @@ typedef struct krtsp_source_options {
     int fps_cap;
     krtsp_pixfmt pixfmt;
     bool low_latency;
+
+    /* Scale-to-fit and pad, so frames arrive at exactly width x height
+     * whatever the camera's aspect ratio is.  See krtsp_args_request. */
+    bool letterbox;
 
     /* No frame for this long, after the grace period, means the camera
      * has wedged: kill and restart.  Default 20000. */

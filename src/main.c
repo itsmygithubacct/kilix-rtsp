@@ -9,6 +9,7 @@
  */
 
 #include "kilix_rtsp.h"
+#include "krtsp_view.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -26,9 +27,13 @@ static void usage(FILE *stream)
         "\n"
         "  list                     cameras and groups from the config\n"
         "  probe <name|url>         stream properties for one camera\n"
+        "  view  <name|url>         one camera filling the terminal\n"
         "\n"
         "options:\n"
-        "  --tier main|sub          stream tier (probe; default sub)\n"
+        "  --tier main|sub          stream tier (default: sub for probe,\n"
+        "                           main for view)\n"
+        "  --fps <n>                cap the delivered frame rate (view)\n"
+        "  --tab                    open the view in a new kilix tab\n"
         "  --config <path>          config file (default\n"
         "                           <state>/config/cameras.conf)\n"
         "\n"
@@ -220,6 +225,176 @@ static int run_ffprobe(const char *url, bool force_tcp, char *output,
     return -2;   /* timed out */
 }
 
+/*
+ * Resolve a camera name or a bare URL to a URL and a label.
+ *
+ * The label is what appears on screen and in messages; it is never a URL,
+ * because a URL is a password.
+ */
+static bool resolve_target(
+    const char *target, krtsp_tier tier, const char *config_path,
+    krtsp_config **config_out, const char **url_out, const char **label_out)
+{
+    *config_out = NULL;
+    *url_out = NULL;
+    *label_out = NULL;
+
+    if (target == NULL) {
+        (void)fprintf(stderr, "kilix-rtsp: expected a camera name or URL\n");
+        return false;
+    }
+    if (strstr(target, "://") != NULL) {
+        *url_out = target;
+        *label_out = "stream";
+        return true;
+    }
+    {
+        krtsp_config *config = load_config_or_warn(config_path, true);
+        const krtsp_camera *camera;
+
+        if (config == NULL) {
+            return false;
+        }
+        camera = krtsp_config_find(config, target);
+        if (camera == NULL) {
+            (void)fprintf(stderr, "kilix-rtsp: no camera named '%s'\n", target);
+            krtsp_config_free(config);
+            return false;
+        }
+        *url_out = krtsp_camera_url(camera, tier);
+        if (*url_out == NULL) {
+            (void)fprintf(stderr, "kilix-rtsp: '%s' has no usable url\n",
+                          target);
+            krtsp_config_free(config);
+            return false;
+        }
+        *config_out = config;
+        *label_out = camera->name;
+        return true;
+    }
+}
+
+/*
+ * Re-launch this command in a new kilix tab.
+ *
+ * The mechanism is the one the kilix desktop already uses to start apps:
+ * kitty remote control, targeted at the socket named by KITTY_LISTEN_ON.
+ * Nothing here is kilix-specific beyond that variable - it works in any
+ * kitty with remote control enabled.
+ *
+ * Returns the child's exit status, or -1 when a tab is not available, in
+ * which case the caller runs inline instead.  Falling back is the right
+ * behaviour: a viewer that refuses to start because it could not open a
+ * tab would be worse than one that simply uses the terminal it has.
+ */
+static int relaunch_in_tab(char **argv, const char *label)
+{
+    static const char *const forwarded[] = {
+        "KILIX_RTSP_HOME", "KILIX_RTSP_FFMPEG", "KILIX_RTSP_FFPROBE"
+    };
+    static char env_pairs[3][640];
+    const char *listen_on = getenv("KITTY_LISTEN_ON");
+    char self[512];
+    char *child[KRTSP_ARGV_MAX];
+    ssize_t length;
+    size_t at = 0u;
+    pid_t pid;
+    int status = 0;
+
+    if (listen_on == NULL || listen_on[0] == '\0') {
+        (void)fprintf(stderr,
+            "kilix-rtsp: --tab needs kitty remote control (KITTY_LISTEN_ON is\n"
+            "            not set); running in this terminal instead.\n");
+        return -1;
+    }
+    length = readlink("/proc/self/exe", self, sizeof(self) - 1u);
+    if (length <= 0) {
+        return -1;
+    }
+    self[length] = '\0';
+
+    child[at++] = (char *)"kitten";
+    child[at++] = (char *)"@";
+    child[at++] = (char *)"--to";
+    child[at++] = (char *)listen_on;
+    child[at++] = (char *)"launch";
+    child[at++] = (char *)"--type=tab";
+    child[at++] = (char *)"--tab-title";
+    child[at++] = (char *)label;
+    /*
+     * A launched tab inherits the terminal's environment, not this
+     * process's, so anything set in the shell that ran this command has
+     * to be forwarded explicitly.  Without this the new tab cannot find
+     * the configuration, fails immediately, and the tab closes again
+     * before the error can be read - which looks like nothing happened.
+     */
+    for (size_t index = 0u; index < sizeof(forwarded) / sizeof(forwarded[0]);
+         ++index) {
+        const char *value = getenv(forwarded[index]);
+
+        if (value == NULL || value[0] == '\0' ||
+            at + 6u >= KRTSP_ARGV_MAX) {
+            continue;
+        }
+        if (snprintf(env_pairs[index], sizeof(env_pairs[index]), "%s=%s",
+                     forwarded[index], value) < 0) {
+            continue;
+        }
+        child[at++] = (char *)"--env";
+        child[at++] = env_pairs[index];
+    }
+    child[at++] = (char *)"--";
+    child[at++] = self;
+    /* Copy the original arguments, dropping --tab so the child does not
+     * try to open a tab of its own. */
+    for (int index = 1; argv[index] != NULL && at + 2u < KRTSP_ARGV_MAX;
+         ++index) {
+        if (strcmp(argv[index], "--tab") == 0) {
+            continue;
+        }
+        child[at++] = argv[index];
+    }
+    child[at] = NULL;
+
+    pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        execvp("kitten", child);
+        /* Older layouts expose remote control through the terminal
+         * binary rather than a separate kitten. */
+        child[0] = (char *)"kilix";
+        execvp("kilix", child);
+        child[0] = (char *)"kitty";
+        execvp("kitty", child);
+        _exit(127);
+    }
+    (void)waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return 0;
+    }
+    (void)fprintf(stderr,
+        "kilix-rtsp: could not open a tab; running in this terminal.\n");
+    return -1;
+}
+
+static int command_view(const char *target, krtsp_tier tier,
+                        const char *config_path, int fps_cap)
+{
+    krtsp_config *config = NULL;
+    const char *url = NULL;
+    const char *label = NULL;
+    int result;
+
+    if (!resolve_target(target, tier, config_path, &config, &url, &label)) {
+        return 2;
+    }
+    result = krtsp_view_run(url, label, fps_cap);
+    krtsp_config_free(config);
+    return result;
+}
+
 static int command_probe(const char *target, krtsp_tier tier,
                          const char *config_path)
 {
@@ -321,6 +496,9 @@ int main(int argc, char **argv)
     const char *target = NULL;
     const char *config_path = NULL;
     krtsp_tier tier = KRTSP_TIER_SUB;
+    bool tier_given = false;
+    bool want_tab = false;
+    int fps_cap = 0;
 
     if (argc < 2) {
         usage(stderr);
@@ -337,6 +515,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[index], "--tier") == 0 && index + 1 < argc) {
             const char *value = argv[++index];
 
+            tier_given = true;
             if (strcmp(value, "main") == 0) {
                 tier = KRTSP_TIER_MAIN;
             } else if (strcmp(value, "sub") == 0) {
@@ -348,6 +527,14 @@ int main(int argc, char **argv)
             }
         } else if (strcmp(argv[index], "--config") == 0 && index + 1 < argc) {
             config_path = argv[++index];
+        } else if (strcmp(argv[index], "--tab") == 0) {
+            want_tab = true;
+        } else if (strcmp(argv[index], "--fps") == 0 && index + 1 < argc) {
+            fps_cap = atoi(argv[++index]);
+            if (fps_cap < 0) {
+                (void)fprintf(stderr, "kilix-rtsp: --fps cannot be negative\n");
+                return 2;
+            }
         } else if (argv[index][0] == '-') {
             (void)fprintf(stderr, "kilix-rtsp: unknown option %s\n",
                           argv[index]);
@@ -366,6 +553,39 @@ int main(int argc, char **argv)
     }
     if (strcmp(command, "probe") == 0) {
         return command_probe(target, tier, config_path);
+    }
+    if (strcmp(command, "view") == 0) {
+        /* A view fills the terminal, so it wants the main stream unless
+         * told otherwise; presenting an upscaled substream throws away
+         * resolution the camera is already producing. */
+        if (!tier_given) {
+            tier = KRTSP_TIER_MAIN;
+        }
+        if (want_tab) {
+            krtsp_config *probe_config = NULL;
+            const char *probe_url = NULL;
+            const char *probe_label = NULL;
+
+            /* Resolve here, before opening the tab.  A bad camera name or
+             * an unreadable config would otherwise fail inside the new
+             * tab, which closes immediately and takes the message with
+             * it - indistinguishable from nothing having happened. */
+            if (!resolve_target(target, tier, config_path, &probe_config,
+                                &probe_url, &probe_label)) {
+                return 2;
+            }
+            {
+                char tab_label[KRTSP_NAME_MAX];
+
+                (void)snprintf(tab_label, sizeof(tab_label), "%s",
+                               probe_label);
+                krtsp_config_free(probe_config);
+                if (relaunch_in_tab(argv, tab_label) == 0) {
+                    return 0;
+                }
+            }
+        }
+        return command_view(target, tier, config_path, fps_cap);
     }
     (void)fprintf(stderr, "kilix-rtsp: unknown command '%s'\n", command);
     usage(stderr);
