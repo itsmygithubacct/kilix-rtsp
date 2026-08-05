@@ -468,41 +468,18 @@ static int command_view(const char *target, krtsp_tier tier,
 static int command_probe(const char *target, krtsp_tier tier,
                          const char *config_path)
 {
-    krtsp_config *config;
+    krtsp_config *config = NULL;
     const char *url = NULL;
+    const char *label = NULL;
     char safe[KRTSP_URL_MAX];
     char escaped[KRTSP_ARGV_STORAGE_MAX];
     static char output[16384];
     int result;
 
-    if (target == NULL) {
-        (void)fprintf(stderr, "kilix-rtsp: probe needs a camera name or URL\n");
-        return 2;
+    if (!resolve_target(target, tier, config_path, &config, &url, &label)) {
+        return 1;
     }
-
-    if (strstr(target, "://") != NULL) {
-        url = target;
-        config = NULL;
-    } else {
-        config = load_config_or_warn(config_path, true);
-        if (config == NULL) {
-            return 1;
-        }
-        const krtsp_camera *camera = krtsp_config_find(config, target);
-
-        if (camera == NULL) {
-            (void)fprintf(stderr, "kilix-rtsp: no camera named '%s'\n", target);
-            krtsp_config_free(config);
-            return 1;
-        }
-        url = krtsp_camera_url(camera, tier);
-        if (url == NULL) {
-            (void)fprintf(stderr, "kilix-rtsp: '%s' has no usable url\n",
-                          target);
-            krtsp_config_free(config);
-            return 1;
-        }
-    }
+    (void)label;
 
     if (!krtsp_url_escape_password(url, escaped, sizeof(escaped))) {
         (void)fprintf(stderr, "kilix-rtsp: url too long\n");
