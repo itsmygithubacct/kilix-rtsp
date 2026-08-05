@@ -1,0 +1,6 @@
+[submodule "third_party/kitty-terminal-session"]
+	path = third_party/kitty-terminal-session
+	url = https://github.com/itsmygithubacct/kitty-terminal-session.git
+[submodule "third_party/soft-raster"]
+	path = third_party/soft-raster
+	url = https://github.com/itsmygithubacct/soft-raster.git
