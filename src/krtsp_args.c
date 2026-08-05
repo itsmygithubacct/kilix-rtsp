@@ -173,7 +173,21 @@ size_t krtsp_build_argv(
         push_arg(&writer, "low_delay");
     }
     push_arg(&writer, "-i");
-    push_arg(&writer, request->url);
+    {
+        /* Escape the password rather than trusting the caller to have
+         * done it.  An unescaped '@' or '/' in a password does not fail
+         * loudly: ffmpeg parses a different host out of the URL and
+         * reports a connection error naming somewhere that does not
+         * exist, which reads as a network fault rather than a quoting
+         * one. */
+        char escaped[KRTSP_ARGV_STORAGE_MAX];
+
+        if (!krtsp_url_escape_password(request->url, escaped,
+                                       sizeof(escaped))) {
+            return 0u;
+        }
+        push_arg(&writer, escaped);
+    }
 
     /* Output.  Audio is dropped: playback is a later concern and a
      * camera's audio track otherwise has to be muxed or discarded
@@ -210,14 +224,129 @@ size_t krtsp_build_argv(
     return writer.argv_count;
 }
 
+/*
+ * Locate the userinfo in an absolute URL.
+ *
+ * Returns false when there is none.  On success `colon` points at the
+ * separator between user and password, or NULL when the userinfo carries
+ * no password, and `at` points at the '@' that ends it.
+ *
+ * The '@' taken is the LAST one inside the authority, not the first: '@'
+ * is legal in a password, and taking the first one both truncates the
+ * password and leaks its tail into what is then parsed as a hostname.
+ */
+static bool find_userinfo(
+    const char *url, const char **colon, const char **at)
+{
+    const char *scheme_end = strstr(url, "://");
+    const char *authority;
+    const char *authority_end;
+    const char *last_at = NULL;
+
+    *colon = NULL;
+    *at = NULL;
+    if (scheme_end == NULL) {
+        return false;
+    }
+    authority = scheme_end + 3;
+    /* The authority ends at the first '/', '?' or '#'; anything after
+     * that is path and cannot hold userinfo. */
+    authority_end = authority + strcspn(authority, "/?#");
+    for (const char *scan = authority; scan < authority_end; ++scan) {
+        if (*scan == '@') {
+            last_at = scan;
+        }
+    }
+    if (last_at == NULL) {
+        return false;
+    }
+    *at = last_at;
+    *colon = memchr(authority, ':', (size_t)(last_at - authority));
+    return true;
+}
+
+bool krtsp_url_escape_password(const char *url, char *out, size_t capacity)
+{
+    /* RFC 3986 unreserved set.  Everything else in the password is
+     * encoded, which is always safe: a percent-encoded unreserved
+     * character would also be understood, but leaving them alone keeps
+     * ordinary passwords readable in a process listing. */
+    static const char unreserved[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    static const char hex[] = "0123456789ABCDEF";
+    const char *colon;
+    const char *at;
+    size_t used = 0u;
+
+    if (out == NULL || capacity == 0u) {
+        return false;
+    }
+    out[0] = '\0';
+    if (url == NULL) {
+        return false;
+    }
+    if (!find_userinfo(url, &colon, &at) || colon == NULL) {
+        /* No password to escape. */
+        size_t length = strlen(url);
+
+        if (length + 1u > capacity) {
+            return false;
+        }
+        memcpy(out, url, length + 1u);
+        return true;
+    }
+
+    /* Everything up to and including the ':' is copied unchanged. */
+    {
+        size_t prefix = (size_t)(colon + 1 - url);
+
+        if (prefix + 1u > capacity) {
+            return false;
+        }
+        memcpy(out, url, prefix);
+        used = prefix;
+    }
+
+    for (const char *scan = colon + 1; scan < at; ++scan) {
+        unsigned char character = (unsigned char)*scan;
+
+        if (strchr(unreserved, character) != NULL && character != '\0') {
+            if (used + 2u > capacity) {
+                out[0] = '\0';
+                return false;
+            }
+            out[used++] = (char)character;
+        } else {
+            /* Note: %20 for space rather than '+'.  A '+' in userinfo is
+             * a literal plus, not a space, so form encoding would be
+             * wrong here even though it is common elsewhere. */
+            if (used + 4u > capacity) {
+                out[0] = '\0';
+                return false;
+            }
+            out[used++] = '%';
+            out[used++] = hex[(character >> 4) & 0x0Fu];
+            out[used++] = hex[character & 0x0Fu];
+        }
+    }
+
+    {
+        size_t tail = strlen(at);
+
+        if (used + tail + 1u > capacity) {
+            out[0] = '\0';
+            return false;
+        }
+        memcpy(out + used, at, tail + 1u);
+    }
+    return true;
+}
+
 bool krtsp_url_redact(const char *url, char *out, size_t capacity)
 {
     static const char mask[] = "***";
-    const char *scheme_end;
-    const char *authority;
-    const char *authority_end;
-    const char *at;
     const char *colon;
+    const char *at;
     size_t prefix;
     size_t needed;
 
@@ -228,24 +357,7 @@ bool krtsp_url_redact(const char *url, char *out, size_t capacity)
     if (url == NULL) {
         return false;
     }
-
-    scheme_end = strstr(url, "://");
-    at = NULL;
-    if (scheme_end != NULL) {
-        authority = scheme_end + 3;
-        /* The authority ends at the first '/', '?' or '#'; anything past
-         * that is path and cannot contain userinfo. */
-        authority_end = authority + strcspn(authority, "/?#");
-        /* The LAST '@' inside the authority delimits userinfo.  Using the
-         * first one leaks the tail of any password containing '@', which
-         * is legal there and does occur. */
-        for (const char *scan = authority; scan < authority_end; ++scan) {
-            if (*scan == '@') {
-                at = scan;
-            }
-        }
-    }
-    if (at == NULL) {
+    if (!find_userinfo(url, &colon, &at)) {
         /* No userinfo: nothing to hide. */
         needed = strlen(url);
         if (needed + 1u > capacity) {
@@ -257,7 +369,6 @@ bool krtsp_url_redact(const char *url, char *out, size_t capacity)
 
     /* Keep the username, mask the password: knowing which account a
      * camera uses is useful in a log and is not the secret. */
-    colon = memchr(scheme_end + 3, ':', (size_t)(at - (scheme_end + 3)));
     prefix = colon != NULL
         ? (size_t)(colon + 1 - url)
         : (size_t)(at - url);
@@ -268,11 +379,10 @@ bool krtsp_url_redact(const char *url, char *out, size_t capacity)
         return false;
     }
     memcpy(out, url, prefix);
-    out[prefix] = '\0';
     if (colon != NULL) {
         memcpy(out + prefix, mask, sizeof(mask) - 1u);
-        out[prefix + sizeof(mask) - 1u] = '\0';
+        prefix += sizeof(mask) - 1u;
     }
-    strcat(out, at);
+    memcpy(out + prefix, at, strlen(at) + 1u);
     return true;
 }

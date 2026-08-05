@@ -16,14 +16,11 @@ object detection are a separate product's concern.
 
 ## Status
 
-**Design complete, implementation not started.** The plan, the measurements
-behind it, and the reading of the reference implementation it is based on are
-written up but deliberately not shipped in this repository.
+Acquisition works: streams are pulled, supervised and handed off, and `list`
+and `probe` are usable. Presentation into the terminal — `view` and `mosaic` —
+is not built yet.
 
 ## Build and test
-
-Nothing builds yet — there are no sources in this repository. When there are,
-the module follows the workspace convention:
 
 ```sh
 make
@@ -31,8 +28,8 @@ make test
 make sanitize
 ```
 
-Dependencies will be a C11 compiler, POSIX, pthreads, and the **`ffmpeg` binary
-at runtime** — not the FFmpeg libraries at link time. `kilix-rtsp` never links
+Dependencies are a C11 compiler, POSIX, pthreads, and the **`ffmpeg` binary at
+runtime** — not the FFmpeg libraries at link time. `kilix-rtsp` never links
 `libavcodec`; it spawns `ffmpeg` and reads raw frames from its stdout. That
 keeps codec failures in a separate, restartable process and picks up whatever
 hardware acceleration the installed ffmpeg has.
@@ -40,7 +37,19 @@ hardware acceleration the installed ffmpeg has.
 ## Use
 
 ```sh
-kilix-rtsp probe   <url>          # stream properties
+kilix-rtsp list                   # configured cameras and groups
+kilix-rtsp probe <name|url>       # stream properties
+kilix-rtsp probe <name> --tier main
+```
+
+`probe` accepts a bare URL as well as a configured name, so it is useful before
+any configuration exists. It prints `key=value` lines on stdout and progress on
+stderr, so the output pipes cleanly. URLs are redacted everywhere they are
+shown.
+
+Still to come:
+
+```sh
 kilix-rtsp view    <camera>       # one camera, full terminal
 kilix-rtsp mosaic  <group>        # several cameras in a grid
 ```

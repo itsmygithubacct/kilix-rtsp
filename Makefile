@@ -18,7 +18,9 @@ LDLIBS += -lpthread
 OBJECTS := \
 	$(BUILD_DIR)/krtsp_args.o \
 	$(BUILD_DIR)/krtsp_frame.o \
-	$(BUILD_DIR)/krtsp_source.o
+	$(BUILD_DIR)/krtsp_source.o \
+	$(BUILD_DIR)/krtsp_paths.o \
+	$(BUILD_DIR)/krtsp_config.o
 
 STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 SHARED_LIB := $(BUILD_DIR)/lib$(PROJECT).so
@@ -26,14 +28,15 @@ SHARED_LIB := $(BUILD_DIR)/lib$(PROJECT).so
 TESTS := \
 	$(BUILD_DIR)/test-args \
 	$(BUILD_DIR)/test-frame \
-	$(BUILD_DIR)/test-source
+	$(BUILD_DIR)/test-source \
+	$(BUILD_DIR)/test-config
 
 FAKE_FFMPEG := $(BUILD_DIR)/fake-ffmpeg
 
 .DEFAULT_GOAL := all
 .PHONY: all clean install test sanitize
 
-all: $(STATIC_LIB) $(SHARED_LIB)
+all: $(STATIC_LIB) $(SHARED_LIB) $(BUILD_DIR)/kilix-rtsp
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -46,6 +49,9 @@ $(STATIC_LIB): $(OBJECTS)
 
 $(SHARED_LIB): $(OBJECTS)
 	$(CC) -shared $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD_DIR)/kilix-rtsp: src/main.c $(STATIC_LIB) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $< $(STATIC_LIB) $(LDLIBS) -o $@
 
 # A stand-in ffmpeg that can be told to misbehave, so process supervision
 # is testable without a camera.  See tests/fake_ffmpeg.c.
@@ -65,12 +71,14 @@ sanitize: clean
 	@$(MAKE) --no-print-directory \
 		CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" test
 
-install: $(STATIC_LIB) $(SHARED_LIB)
+install: all $(BUILD_DIR)/kilix-rtsp
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/include
 	$(INSTALL) -m 644 include/kilix_rtsp.h $(DESTDIR)$(PREFIX)/include/
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/lib
 	$(INSTALL) -m 644 $(STATIC_LIB) $(DESTDIR)$(PREFIX)/lib/
 	$(INSTALL) -m 755 $(SHARED_LIB) $(DESTDIR)$(PREFIX)/lib/
+	$(INSTALL) -d $(DESTDIR)$(PREFIX)/bin
+	$(INSTALL) -m 755 $(BUILD_DIR)/kilix-rtsp $(DESTDIR)$(PREFIX)/bin/
 
 clean:
 	rm -rf $(BUILD_DIR)
