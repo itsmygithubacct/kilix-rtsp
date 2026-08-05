@@ -1,0 +1,39 @@
+# kilix-rtsp camera definitions — EXAMPLE
+#
+# Copy to ~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf and fill in real
+# values. That file is mode 0600 and lives outside the repository because RTSP
+# URLs embed credentials.
+#
+#   cp examples/cameras.conf.example \
+#      ~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf
+#   chmod 600 ~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf
+#
+# Each camera carries a full URL per tier. Tiers are NOT synthesized from one
+# another: device families use incompatible path conventions, and some use a
+# non-standard port. Give both URLs explicitly.
+#
+#   main  full resolution, used by `view`   (may be HEVC)
+#   sub   low resolution,  used by `mosaic`
+#
+# Omit a tier to make it unavailable; a camera with only `sub` still works in
+# both views, at substream resolution.
+
+[camera "front"]
+main = rtsp://USER:PASSWORD@192.0.2.10:554/stream1
+sub  = rtsp://USER:PASSWORD@192.0.2.10:554/stream2
+
+[camera "side"]
+main = rtsp://USER:PASSWORD@192.0.2.11:554/live/ch0
+sub  = rtsp://USER:PASSWORD@192.0.2.11:554/live/ch1
+
+# Non-standard port, and a path convention unlike either of the above.
+[camera "garage"]
+main = rtsp://USER:PASSWORD@192.0.2.12:10554/tcp/av0_0
+sub  = rtsp://USER:PASSWORD@192.0.2.12:10554/tcp/av0_1
+
+# Named groups for `kilix-rtsp mosaic <group>`.
+[group "all"]
+cameras = front, side, garage
+
+[group "outside"]
+cameras = front, side
