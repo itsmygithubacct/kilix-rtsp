@@ -398,6 +398,49 @@ const krtsp_group *krtsp_config_find_group(
  */
 const char *krtsp_camera_url(const krtsp_camera *camera, krtsp_tier tier);
 
+/* ------------------------------- mosaic --------------------------------- */
+
+/*
+ * Grid layout for N cameras on one canvas.
+ *
+ * Pure arithmetic: no canvas, no sources, no terminal.  Layout is where a
+ * mosaic is right or wrong - tiles that overlap, leave the canvas, or
+ * distort the picture are all layout bugs - so it is kept testable on its
+ * own.
+ */
+typedef struct krtsp_tile {
+    int x;
+    int y;
+    int width;
+    int height;
+    size_t index;   /* which source this tile belongs to */
+} krtsp_tile;
+
+/*
+ * Fill `tiles` with a grid for `count` sources on a canvas_width x
+ * canvas_height canvas, preferring tiles close to `aspect` (width /
+ * height; pass 16.0f/9.0f for typical cameras).
+ *
+ * Returns the number of tiles placed, or 0 on invalid arguments or
+ * insufficient capacity.  Tiles never overlap and never leave the canvas.
+ * A final short row is centred, because a row of three under a row of
+ * four looks like a mistake when it is left-aligned.
+ *
+ * Tile dimensions are forced even: odd sizes make some ffmpeg scalers
+ * unhappy and every source here is decoded straight to its tile size.
+ */
+size_t krtsp_mosaic_layout(
+    int canvas_width,
+    int canvas_height,
+    size_t count,
+    float aspect,
+    krtsp_tile *tiles,
+    size_t capacity);
+
+/* Columns the layout would choose; exposed for tests and diagnostics. */
+size_t krtsp_mosaic_columns(
+    int canvas_width, int canvas_height, size_t count, float aspect);
+
 #ifdef __cplusplus
 }
 #endif

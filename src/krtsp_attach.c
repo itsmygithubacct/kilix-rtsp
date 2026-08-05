@@ -38,7 +38,8 @@
  * it.  It is in the broker's own command line, and the broker is this
  * process's parent, so read it from there.
  */
-static bool runtime_dir_from(pid_t pid, char *out, size_t capacity)
+static bool runtime_dir_from(
+    pid_t pid, const char *want_session, char *out, size_t capacity)
 {
     char path[64];
     char buffer[4096];
@@ -46,6 +47,10 @@ static bool runtime_dir_from(pid_t pid, char *out, size_t capacity)
     size_t used;
     size_t at = 0u;
     bool is_broker = false;
+    bool id_matches = false;
+    char found_dir[KRTSP_ATTACH_DIR_MAX];
+
+    found_dir[0] = '\0';
 
     if (snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid) < 0) {
         return false;
@@ -73,15 +78,38 @@ static bool runtime_dir_from(pid_t pid, char *out, size_t capacity)
             at + length + 1u < used) {
             const char *value = buffer + at + length + 1u;
 
-            if (value[0] == '\0' || strlen(value) >= capacity) {
-                return false;
+            if (value[0] != '\0' && strlen(value) < sizeof(found_dir)) {
+                (void)snprintf(found_dir, sizeof(found_dir), "%s", value);
             }
-            (void)snprintf(out, capacity, "%s", value);
-            return true;
+        }
+        /*
+         * The session id must be this broker's own.
+         *
+         * KITTY_PTY_BROKER_SESSION is inherited like any other variable,
+         * so a process launched from a brokered pane - or by a terminal
+         * that was itself started inside one - sees an id belonging to
+         * somebody else's session.  Trusting it means asking about the
+         * wrong pane: observed live, a visible mosaic stopped streaming
+         * because an unrelated detached session answered "not attached".
+         *
+         * The broker that actually owns this process names its session on
+         * its own command line, so require that to match.
+         */
+        if (is_broker && strcmp(argument, "--id") == 0 &&
+            at + length + 1u < used) {
+            const char *value = buffer + at + length + 1u;
+
+            if (want_session != NULL && strcmp(value, want_session) == 0) {
+                id_matches = true;
+            }
         }
         at += length + 1u;
     }
-    return false;
+    if (!id_matches || found_dir[0] == '\0' || strlen(found_dir) >= capacity) {
+        return false;
+    }
+    (void)snprintf(out, capacity, "%s", found_dir);
+    return true;
 }
 
 void krtsp_attach_init(krtsp_attach *watch)
@@ -109,7 +137,7 @@ void krtsp_attach_init(krtsp_attach *watch)
 
     /* The parent is normally the broker; check a grandparent too, in case
      * something wraps the launch. */
-    if (!runtime_dir_from(getppid(), watch->runtime_dir,
+    if (!runtime_dir_from(getppid(), watch->session_id, watch->runtime_dir,
                           sizeof(watch->runtime_dir))) {
         char path[64];
         FILE *handle;
@@ -141,8 +169,12 @@ void krtsp_attach_init(krtsp_attach *watch)
             }
         }
         if (grandparent <= 1 ||
-            !runtime_dir_from((pid_t)grandparent, watch->runtime_dir,
+            !runtime_dir_from((pid_t)grandparent, watch->session_id,
+                              watch->runtime_dir,
                               sizeof(watch->runtime_dir))) {
+            /* No ancestor broker owns this session id: the variable was
+             * inherited.  Treat the view as always attached rather than
+             * acting on someone else's pane. */
             return;
         }
     }

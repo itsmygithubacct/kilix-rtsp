@@ -13,7 +13,7 @@ WARNINGS := \
 	-Wstrict-prototypes -Wmissing-prototypes -Wformat=2
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=c11 -fPIC $(WARNINGS)
-LDLIBS += -lpthread
+LDLIBS += -lpthread -lm
 
 # Vendored, pinned dependencies for the terminal-facing commands.  The
 # library itself (acquisition) depends on none of them.
@@ -54,7 +54,8 @@ OBJECTS := \
 	$(BUILD_DIR)/krtsp_frame.o \
 	$(BUILD_DIR)/krtsp_source.o \
 	$(BUILD_DIR)/krtsp_paths.o \
-	$(BUILD_DIR)/krtsp_config.o
+	$(BUILD_DIR)/krtsp_config.o \
+	$(BUILD_DIR)/krtsp_mosaic.o
 
 STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 SHARED_LIB := $(BUILD_DIR)/lib$(PROJECT).so
@@ -63,7 +64,8 @@ TESTS := \
 	$(BUILD_DIR)/test-args \
 	$(BUILD_DIR)/test-frame \
 	$(BUILD_DIR)/test-source \
-	$(BUILD_DIR)/test-config
+	$(BUILD_DIR)/test-config \
+	$(BUILD_DIR)/test-mosaic
 
 FAKE_FFMPEG := $(BUILD_DIR)/fake-ffmpeg
 

@@ -28,6 +28,7 @@ static void usage(FILE *stream)
         "  list                     cameras and groups from the config\n"
         "  probe <name|url>         stream properties for one camera\n"
         "  view  <name|url>         one camera filling the terminal\n"
+        "  mosaic <group|name...>   several cameras in a grid\n"
         "\n"
         "options:\n"
         "  --tier main|sub          stream tier (default: sub for probe,\n"
@@ -379,6 +380,75 @@ static int relaunch_in_tab(char **argv, const char *label)
     return -1;
 }
 
+/*
+ * Resolve a group name, or a list of camera names, into urls and labels.
+ * A mosaic tile is far smaller than a main stream, so tiles take the sub
+ * stream: the extra resolution would be decoded only to be discarded.
+ */
+static int command_mosaic(
+    char **names, size_t name_count, const char *config_path, int fps_cap)
+{
+    krtsp_config *config = load_config_or_warn(config_path, true);
+    const char *urls[16];
+    const char *labels[16];
+    size_t count = 0u;
+    int result;
+
+    if (config == NULL) {
+        return 1;
+    }
+    if (name_count == 0u) {
+        /* No argument: every configured camera, which is the common case
+         * for a wall display. */
+        count = krtsp_config_camera_count(config);
+        if (count > 16u) {
+            count = 16u;
+        }
+        for (size_t index = 0u; index < count; ++index) {
+            const krtsp_camera *camera = krtsp_config_camera_at(config, index);
+
+            urls[index] = krtsp_camera_url(camera, KRTSP_TIER_SUB);
+            labels[index] = camera->name;
+        }
+    } else if (name_count == 1u &&
+               krtsp_config_find_group(config, names[0]) != NULL) {
+        const krtsp_group *group = krtsp_config_find_group(config, names[0]);
+
+        count = group->member_count > 16u ? 16u : group->member_count;
+        for (size_t index = 0u; index < count; ++index) {
+            const krtsp_camera *camera =
+                krtsp_config_find(config, group->members[index]);
+
+            urls[index] = krtsp_camera_url(camera, KRTSP_TIER_SUB);
+            labels[index] = camera->name;
+        }
+    } else {
+        for (size_t index = 0u; index < name_count && index < 16u; ++index) {
+            const krtsp_camera *camera =
+                krtsp_config_find(config, names[index]);
+
+            if (camera == NULL) {
+                (void)fprintf(stderr,
+                              "kilix-rtsp: no camera or group named '%s'\n",
+                              names[index]);
+                krtsp_config_free(config);
+                return 1;
+            }
+            urls[index] = krtsp_camera_url(camera, KRTSP_TIER_SUB);
+            labels[index] = camera->name;
+            count++;
+        }
+    }
+    if (count == 0u) {
+        (void)fprintf(stderr, "kilix-rtsp: no cameras to show\n");
+        krtsp_config_free(config);
+        return 1;
+    }
+    result = krtsp_mosaic_run(urls, labels, count, fps_cap);
+    krtsp_config_free(config);
+    return result;
+}
+
 static int command_view(const char *target, krtsp_tier tier,
                         const char *config_path, int fps_cap)
 {
@@ -499,6 +569,8 @@ int main(int argc, char **argv)
     bool tier_given = false;
     bool want_tab = false;
     int fps_cap = 0;
+    char *positional[16];
+    int positional_count = 0;
 
     if (argc < 2) {
         usage(stderr);
@@ -539,12 +611,14 @@ int main(int argc, char **argv)
             (void)fprintf(stderr, "kilix-rtsp: unknown option %s\n",
                           argv[index]);
             return 2;
-        } else if (target == NULL) {
-            target = argv[index];
         } else {
-            (void)fprintf(stderr, "kilix-rtsp: unexpected argument %s\n",
-                          argv[index]);
-            return 2;
+            if (target == NULL) {
+                target = argv[index];
+            }
+            if (positional_count < (int)(sizeof(positional) /
+                                         sizeof(positional[0]))) {
+                positional[positional_count++] = argv[index];
+            }
         }
     }
 
@@ -586,6 +660,10 @@ int main(int argc, char **argv)
             }
         }
         return command_view(target, tier, config_path, fps_cap);
+    }
+    if (strcmp(command, "mosaic") == 0) {
+        return command_mosaic(positional, (size_t)positional_count,
+                              config_path, fps_cap);
     }
     (void)fprintf(stderr, "kilix-rtsp: unknown command '%s'\n", command);
     usage(stderr);

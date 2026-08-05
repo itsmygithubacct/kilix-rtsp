@@ -380,3 +380,308 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     g_session = NULL;
     return exit_code;
 }
+
+/* ------------------------------- mosaic --------------------------------- */
+
+#define KRTSP_MOSAIC_MAX 16
+
+/* Upper bound on full-canvas recomposites per second.  Cameras here
+ * deliver 8-20 fps each and arrive independently. */
+#define KRTSP_MOSAIC_MAX_FPS 20
+
+typedef struct mosaic_slot {
+    krtsp_source *source;
+    krtsp_tile tile;
+    const char *label;
+    uint64_t last_frames;
+} mosaic_slot;
+
+/* Start one source per tile, each decoding straight to its tile size.
+ * That is the whole reason a mosaic is affordable: cost follows output
+ * pixels, and seven tiles hold fewer pixels than one full-screen view. */
+static bool mosaic_start_sources(
+    mosaic_slot *slots, size_t count, const char **urls, int fps_cap)
+{
+    krtsp_source_options options;
+
+    for (size_t index = 0u; index < count; ++index) {
+        krtsp_source_options_init(&options);
+        options.width = slots[index].tile.width;
+        options.height = slots[index].tile.height;
+        options.fps_cap = fps_cap;
+        options.letterbox = true;
+        options.pixfmt = KRTSP_PIXFMT_BGRA;
+        /* Sub stream: a tile is far smaller than the main stream, so the
+         * extra resolution would be decoded only to be thrown away. */
+        if (!krtsp_source_start(&slots[index].source, urls[index], &options)) {
+            return false;
+        }
+        slots[index].last_frames = UINT64_MAX;
+    }
+    return true;
+}
+
+static void mosaic_stop_sources(mosaic_slot *slots, size_t count)
+{
+    for (size_t index = 0u; index < count; ++index) {
+        krtsp_source_stop(slots[index].source);
+        slots[index].source = NULL;
+    }
+}
+
+int krtsp_mosaic_run(
+    const char **urls, const char **labels, size_t count, int fps_cap)
+{
+    kittyts_options options;
+    kittyts_session session;
+    mosaic_slot slots[KRTSP_MOSAIC_MAX];
+    krtsp_tile tiles[KRTSP_MOSAIC_MAX];
+    krtsp_attach attach;
+    sr_canvas canvas;
+    uint8_t *present_buffer = NULL;
+    long long attach_checked_at = 0;
+    long long resize_pending_at = 0;
+    long long composed_at = 0;
+    bool streaming = true;
+    int width;
+    int height;
+    int exit_code = 0;
+
+    if (urls == NULL || labels == NULL || count == 0u ||
+        count > KRTSP_MOSAIC_MAX) {
+        return 2;
+    }
+    (void)memset(slots, 0, sizeof(slots));
+
+    kittyts_options_init(&options);
+    kittyts_session_init(&session);
+    options.framebuffer.transport = KITTYFB_TRANSPORT_AUTO;
+    options.framebuffer.max_width = 7680;
+    options.framebuffer.max_height = 4320;
+
+    if (kittyts_start(&session, STDIN_FILENO, STDOUT_FILENO, &options) != 0) {
+        if (errno == ENOTSUP) {
+            (void)fprintf(stderr,
+                "kilix-rtsp: this terminal does not speak the Kitty graphics "
+                "protocol.\n");
+        } else {
+            perror("kilix-rtsp: cannot start the terminal session");
+        }
+        return 1;
+    }
+    g_session = &session;
+    (void)signal(SIGSEGV, handle_fatal);
+    (void)signal(SIGBUS, handle_fatal);
+    (void)signal(SIGABRT, handle_fatal);
+    (void)signal(SIGINT, handle_interrupt);
+    (void)signal(SIGTERM, handle_interrupt);
+    (void)signal(SIGPIPE, SIG_IGN);
+
+    width = kittyts_width(&session);
+    height = kittyts_height(&session);
+    krtsp_attach_init(&attach);
+
+    if (krtsp_mosaic_layout(width, height, count, 16.0f / 9.0f, tiles,
+                            KRTSP_MOSAIC_MAX) != count) {
+        kittyts_stop(&session);
+        g_session = NULL;
+        (void)fprintf(stderr,
+            "kilix-rtsp: the terminal is too small for %zu cameras\n", count);
+        return 1;
+    }
+    for (size_t index = 0u; index < count; ++index) {
+        slots[index].tile = tiles[index];
+        slots[index].label = labels[index];
+    }
+    present_buffer = malloc((size_t)width * (size_t)height * 4u);
+    if (present_buffer == NULL || !mosaic_start_sources(slots, count, urls,
+                                                        fps_cap)) {
+        mosaic_stop_sources(slots, count);
+        free(present_buffer);
+        kittyts_stop(&session);
+        g_session = NULL;
+        return 1;
+    }
+
+    while (!g_quit) {
+        int new_width;
+        int new_height;
+        bool any_new = false;
+
+        /* Detached panes decode nothing; see krtsp_attach.c. */
+        if (monotonic_ms() - attach_checked_at > 1000) {
+            bool attached = krtsp_attach_is_attached(&attach);
+
+            attach_checked_at = monotonic_ms();
+            if (!attached && streaming) {
+                mosaic_stop_sources(slots, count);
+                streaming = false;
+            } else if (attached && !streaming) {
+                if (!mosaic_start_sources(slots, count, urls, fps_cap)) {
+                    exit_code = 1;
+                    break;
+                }
+                streaming = true;
+            }
+        }
+        if (!streaming) {
+            sleep_ms(250);
+            continue;
+        }
+
+        if (kittyts_check_resize(&session, &new_width, &new_height)) {
+            resize_pending_at = monotonic_ms();
+        }
+        if (resize_pending_at != 0 &&
+            monotonic_ms() - resize_pending_at > 250) {
+            resize_pending_at = 0;
+            new_width = kittyts_width(&session);
+            new_height = kittyts_height(&session);
+            if (new_width != width || new_height != height) {
+                uint8_t *grown = realloc(
+                    present_buffer,
+                    (size_t)new_width * (size_t)new_height * 4u);
+
+                if (grown != NULL &&
+                    krtsp_mosaic_layout(new_width, new_height, count,
+                                        16.0f / 9.0f, tiles,
+                                        KRTSP_MOSAIC_MAX) == count) {
+                    present_buffer = grown;
+                    width = new_width;
+                    height = new_height;
+                    mosaic_stop_sources(slots, count);
+                    for (size_t index = 0u; index < count; ++index) {
+                        slots[index].tile = tiles[index];
+                    }
+                    if (!mosaic_start_sources(slots, count, urls, fps_cap)) {
+                        exit_code = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        (void)kittyts_read_input(&session);
+        {
+            kittyin_event event;
+
+            while (kittyts_next_event(&session, &event)) {
+                if (event.kind == KITTYIN_EVENT_KEY &&
+                    event.data.key.action != KITTYKB_ACTION_RELEASE &&
+                    (event.data.key.key == 'q' ||
+                     event.data.key.key == 'Q' ||
+                     event.data.key.key == 27u)) {
+                    g_quit = 1;
+                }
+            }
+        }
+        if (g_quit) {
+            break;
+        }
+
+        /*
+         * Redraw when some tile has a new frame, but no more often than
+         * KRTSP_MOSAIC_MAX_FPS.
+         *
+         * Compositing is per-canvas, not per-tile: one new frame costs a
+         * full clear, seven blits, seven captions and a pack of the whole
+         * canvas.  Seven cameras arriving independently at 8-20 fps would
+         * otherwise trigger up to seventy of those a second to produce at
+         * most twenty visibly different frames.  The cap turns most of
+         * that into one composite carrying several tiles' updates.
+         */
+        for (size_t index = 0u; index < count; ++index) {
+            krtsp_source_stats stats;
+
+            krtsp_source_get_stats(slots[index].source, &stats);
+            if (stats.frames != slots[index].last_frames) {
+                any_new = true;
+            }
+        }
+        if (!any_new ||
+            monotonic_ms() - composed_at < 1000 / KRTSP_MOSAIC_MAX_FPS) {
+            sleep_ms(5);
+            continue;
+        }
+        composed_at = monotonic_ms();
+
+        sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
+                       width, height);
+        sr_clear(&canvas, 0x0A0A0Cu);
+
+        for (size_t index = 0u; index < count; ++index) {
+            const krtsp_tile *tile = &slots[index].tile;
+            krtsp_source_stats stats;
+            krtsp_status status = krtsp_source_status(slots[index].source);
+            const uint8_t *pixels;
+            int age_ms = 0;
+            char caption[128];
+
+            krtsp_source_get_stats(slots[index].source, &stats);
+            slots[index].last_frames = stats.frames;
+
+            pixels = krtsp_source_borrow(slots[index].source, &age_ms);
+            if (pixels != NULL) {
+                sr_canvas source_canvas;
+
+                sr_canvas_wrap(&source_canvas,
+                               (uint32_t *)(void *)(uintptr_t)pixels,
+                               tile->width, tile->height);
+                sr_blit(&canvas, &source_canvas, tile->x, tile->y);
+                krtsp_source_release(slots[index].source);
+            } else {
+                sr_fill_rect(&canvas, (float)tile->x, (float)tile->y,
+                             (float)tile->width, (float)tile->height,
+                             0x141418u, 1.0f);
+            }
+
+            /* Every tile is captioned.  In a grid, "which camera is
+             * that" is the first question, and an unlabelled tile that
+             * has frozen is indistinguishable from a quiet scene. */
+            if (pixels == NULL) {
+                (void)snprintf(caption, sizeof(caption), "%s  %s",
+                               slots[index].label,
+                               status == KRTSP_STARTING ? "connecting"
+                                                        : krtsp_status_name(status));
+            } else if (status != KRTSP_ONLINE || age_ms > 2000) {
+                (void)snprintf(caption, sizeof(caption), "%s  %s  %.0fs",
+                               slots[index].label, krtsp_status_name(status),
+                               (double)age_ms / 1000.0);
+            } else {
+                (void)snprintf(caption, sizeof(caption), "%s",
+                               slots[index].label);
+            }
+            {
+                int pad = 4;
+                int band = SR_FONT_H + pad;
+
+                for (int y = 0; y < band && tile->y + y < height; ++y) {
+                    for (int x = 0; x < tile->width; ++x) {
+                        sr_blend(&canvas, tile->x + x, tile->y + y,
+                                 0x000000u, 0.5f);
+                    }
+                }
+                sr_fill_rect(&canvas, (float)tile->x, (float)tile->y, 3.0f,
+                             (float)band,
+                             status_accent(status), 1.0f);
+                sr_text_shadow(&canvas, (float)(tile->x + pad + 3),
+                               (float)(tile->y + pad / 2), caption,
+                               0xFFFFFFu, 1.0f, 1);
+            }
+        }
+
+        (void)sr_pack_rgba(&canvas, present_buffer,
+                           (size_t)width * (size_t)height * 4u);
+        if (!kittyts_present(&session, present_buffer, width, height)) {
+            exit_code = 1;
+            break;
+        }
+        sleep_ms(8);
+    }
+
+    mosaic_stop_sources(slots, count);
+    free(present_buffer);
+    kittyts_stop(&session);
+    g_session = NULL;
+    return exit_code;
+}
