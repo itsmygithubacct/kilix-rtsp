@@ -4,3 +4,6 @@
 [submodule "third_party/soft-raster"]
 	path = third_party/soft-raster
 	url = https://github.com/itsmygithubacct/soft-raster.git
+[submodule "third_party/kitty-pty-broker"]
+	path = third_party/kitty-pty-broker
+	url = https://github.com/itsmygithubacct/kitty-pty-broker.git

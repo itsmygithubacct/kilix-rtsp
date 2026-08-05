@@ -21,13 +21,22 @@ KTS := third_party/kitty-terminal-session
 KIN := $(KTS)/third_party/kitty-input
 KKB := $(KIN)/third_party/kitty_keyboard
 SR  := third_party/soft-raster
+KPB := third_party/kitty-pty-broker
 
 VIEW_CPPFLAGS := \
 	-I$(KTS)/include -I$(KTS)/third_party/kitty-framebuffer/include \
-	-I$(KIN)/include -I$(KKB)/include -I$(SR)/include -Isrc
+	-I$(KIN)/include -I$(KKB)/include -I$(SR)/include -I$(KPB)/include -Isrc
 
+# Our own terminal-facing sources: full warning set.
 VIEW_SOURCES := \
 	src/krtsp_view.c \
+	src/krtsp_attach.c
+
+# Vendored dependencies, compiled with the project's flags minus the
+# noisiest conversion warnings.  They are pinned upstream code; letting
+# their warnings through would bury our own.
+VENDOR_SOURCES := \
+	$(KPB)/src/kitty_pty_broker.c \
 	$(KTS)/src/kitty_terminal_session.c \
 	$(KTS)/third_party/kitty-framebuffer/src/kitty_framebuffer.c \
 	$(KIN)/src/kitty_input.c \
@@ -35,6 +44,8 @@ VIEW_SOURCES := \
 	$(KKB)/src/kitty_keyboard.c \
 	$(KKB)/src/kitty_keyboard_posix.c \
 	$(SR)/src/soft_raster.c
+
+VENDOR_CFLAGS := $(CFLAGS) -Wno-conversion -Wno-sign-conversion
 
 VIEW_LDLIBS := -lz -lm
 
@@ -73,12 +84,16 @@ $(STATIC_LIB): $(OBJECTS)
 $(SHARED_LIB): $(OBJECTS)
 	$(CC) -shared $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD_DIR)/kilix-rtsp: src/main.c $(VIEW_SOURCES) $(STATIC_LIB) | $(BUILD_DIR)
+$(BUILD_DIR)/kilix-rtsp: src/main.c $(VIEW_SOURCES) $(VENDOR_SOURCES) $(STATIC_LIB) | $(BUILD_DIR)
 	@test -f $(KTS)/src/kitty_terminal_session.c || { \
 		printf 'submodules missing; run: git submodule update --init --recursive\n' >&2; \
 		exit 1; }
+	$(CC) $(CPPFLAGS) $(VIEW_CPPFLAGS) $(VENDOR_CFLAGS) -c \
+		$(VENDOR_SOURCES) && mkdir -p $(BUILD_DIR)/vendor && \
+		mv *.o $(BUILD_DIR)/vendor/
 	$(CC) $(CPPFLAGS) $(VIEW_CPPFLAGS) $(CFLAGS) $(LDFLAGS) \
-		src/main.c $(VIEW_SOURCES) $(STATIC_LIB) $(LDLIBS) $(VIEW_LDLIBS) -o $@
+		src/main.c $(VIEW_SOURCES) $(BUILD_DIR)/vendor/*.o \
+		$(STATIC_LIB) $(LDLIBS) $(VIEW_LDLIBS) -o $@
 
 # A stand-in ffmpeg that can be told to misbehave, so process supervision
 # is testable without a camera.  See tests/fake_ffmpeg.c.

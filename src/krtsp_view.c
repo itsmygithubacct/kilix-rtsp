@@ -20,6 +20,7 @@
 
 #include "kilix_rtsp.h"
 #include "krtsp_view.h"
+#include "krtsp_attach.h"
 
 #include "kitty_terminal_session.h"
 #include "soft_raster.h"
@@ -131,6 +132,9 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     krtsp_source *source = NULL;
     krtsp_source_options source_options;
     sr_canvas canvas;
+    krtsp_attach attach;
+    bool streaming = true;
+    long long attach_checked_at = 0;
     uint8_t *present_buffer = NULL;
     uint64_t last_sequence = UINT64_MAX;
     long long resize_pending_at = 0;
@@ -177,6 +181,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
 
     width = kittyts_width(&session);
     height = kittyts_height(&session);
+    krtsp_attach_init(&attach);
 
     krtsp_source_options_init(&source_options);
     source_options.width = width;
@@ -209,6 +214,43 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
         const uint8_t *pixels;
         krtsp_status status;
         char banner[192];
+
+        /*
+         * Stop decoding while nobody is looking.
+         *
+         * Closing a kilix tab detaches the pane rather than ending it -
+         * kitty-pty-broker keeps the session alive so it can be attached
+         * again.  Nothing about the terminal reveals that: no SIGHUP,
+         * writes still succeed, the window size still reads back.  So ask
+         * the broker, and when the answer is "nobody", stop the stream
+         * outright.  Decoding H.264 at a third of a core into a journal
+         * no one is reading is pure waste, and a detached view is
+         * invisible - there is nothing on screen to suggest it is still
+         * running.
+         */
+        if (monotonic_ms() - attach_checked_at > 1000) {
+            bool attached = krtsp_attach_is_attached(&attach);
+
+            attach_checked_at = monotonic_ms();
+            if (!attached && streaming) {
+                krtsp_source_stop(source);
+                source = NULL;
+                streaming = false;
+            } else if (attached && !streaming) {
+                if (!krtsp_source_start(&source, url, &source_options)) {
+                    exit_code = 1;
+                    break;
+                }
+                streaming = true;
+                last_sequence = UINT64_MAX;
+            }
+        }
+        if (!streaming) {
+            /* Detached: no decode, no present, no busy loop.  The next
+             * attach restarts the stream. */
+            sleep_ms(250);
+            continue;
+        }
 
         /*
          * A resize means a new decode size, which means restarting
