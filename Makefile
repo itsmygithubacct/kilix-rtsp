@@ -47,6 +47,12 @@ VENDOR_SOURCES := \
 
 VENDOR_CFLAGS := $(CFLAGS) -Wno-conversion -Wno-sign-conversion
 
+# One object per vendored source, built in place.  Compiling them as a
+# group into the current directory and moving the results afterwards put
+# objects in the work tree, swept up any unrelated *.o next to them, and
+# recompiled every dependency on every build.
+VENDOR_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/vendor/%.o,$(notdir $(VENDOR_SOURCES)))
+
 VIEW_LDLIBS := -lz -lm
 
 OBJECTS := \
@@ -86,15 +92,22 @@ $(STATIC_LIB): $(OBJECTS)
 $(SHARED_LIB): $(OBJECTS)
 	$(CC) -shared $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD_DIR)/kilix-rtsp: src/main.c $(VIEW_SOURCES) $(VENDOR_SOURCES) $(STATIC_LIB) | $(BUILD_DIR)
+$(BUILD_DIR)/vendor:
+	mkdir -p $@
+
+# vpath lets one pattern rule cover vendored sources from several trees.
+vpath %.c $(sort $(dir $(VENDOR_SOURCES)))
+
+$(BUILD_DIR)/vendor/%.o: %.c | $(BUILD_DIR)/vendor
+	$(CC) $(CPPFLAGS) $(VIEW_CPPFLAGS) $(VENDOR_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kilix-rtsp: src/main.c $(VIEW_SOURCES) $(VENDOR_OBJECTS) \
+		$(STATIC_LIB) | $(BUILD_DIR)
 	@test -f $(KTS)/src/kitty_terminal_session.c || { \
 		printf 'submodules missing; run: git submodule update --init --recursive\n' >&2; \
 		exit 1; }
-	$(CC) $(CPPFLAGS) $(VIEW_CPPFLAGS) $(VENDOR_CFLAGS) -c \
-		$(VENDOR_SOURCES) && mkdir -p $(BUILD_DIR)/vendor && \
-		mv *.o $(BUILD_DIR)/vendor/
 	$(CC) $(CPPFLAGS) $(VIEW_CPPFLAGS) $(CFLAGS) $(LDFLAGS) \
-		src/main.c $(VIEW_SOURCES) $(BUILD_DIR)/vendor/*.o \
+		src/main.c $(VIEW_SOURCES) $(VENDOR_OBJECTS) \
 		$(STATIC_LIB) $(LDLIBS) $(VIEW_LDLIBS) -o $@
 
 # A stand-in ffmpeg that can be told to misbehave, so process supervision

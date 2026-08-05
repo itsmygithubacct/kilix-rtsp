@@ -125,9 +125,71 @@ static uint32_t status_accent(krtsp_status status)
     }
 }
 
-int krtsp_view_run(const char *url, const char *label, int fps_cap)
+
+/*
+ * Bring up the terminal for a full-window video view.
+ *
+ * Shared by both commands: they differ in what they draw, not in how the
+ * terminal is acquired, and two copies of this drifted apart once already
+ * (the framebuffer size cap was raised in one and not the other).
+ */
+static bool start_terminal(kittyts_session *session)
 {
     kittyts_options options;
+
+    kittyts_options_init(&options);
+    kittyts_session_init(session);
+    /* AUTO picks shared memory when it can, which is what makes a
+     * full-window camera view affordable at all. */
+    options.framebuffer.transport = KITTYFB_TRANSPORT_AUTO;
+    /*
+     * Let the framebuffer use the whole terminal.  The library defaults
+     * cap it at 1600x1000, which suits a game with a fixed art scale but
+     * boxes a camera view inside a black border on a larger screen - and
+     * letterboxes the picture a second time inside that box.
+     */
+    options.framebuffer.max_width = 7680;
+    options.framebuffer.max_height = 4320;
+
+    if (kittyts_start(session, STDIN_FILENO, STDOUT_FILENO, &options) != 0) {
+        if (errno == ENOTSUP) {
+            (void)fprintf(stderr,
+                "kilix-rtsp: this terminal answered the device query but does\n"
+                "            not speak the Kitty graphics protocol.\n");
+        } else {
+            perror("kilix-rtsp: cannot start the terminal session");
+        }
+        return false;
+    }
+    g_session = session;
+    (void)signal(SIGSEGV, handle_fatal);
+    (void)signal(SIGBUS, handle_fatal);
+    (void)signal(SIGABRT, handle_fatal);
+    (void)signal(SIGINT, handle_interrupt);
+    (void)signal(SIGTERM, handle_interrupt);
+    (void)signal(SIGPIPE, SIG_IGN);
+    return true;
+}
+
+/* Drain input and set g_quit on a quit key.  Both commands quit the same
+ * way; only their drawing differs. */
+static void consume_input(kittyts_session *session)
+{
+    kittyin_event event;
+
+    (void)kittyts_read_input(session);
+    while (kittyts_next_event(session, &event)) {
+        if (event.kind == KITTYIN_EVENT_KEY &&
+            event.data.key.action != KITTYKB_ACTION_RELEASE &&
+            (event.data.key.key == 'q' || event.data.key.key == 'Q' ||
+             event.data.key.key == 27u)) {
+            g_quit = 1;
+        }
+    }
+}
+
+int krtsp_view_run(const char *url, const char *label, int fps_cap)
+{
     kittyts_session session;
     krtsp_source *source = NULL;
     krtsp_source_options source_options;
@@ -146,38 +208,9 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
         return 2;
     }
 
-    kittyts_options_init(&options);
-    kittyts_session_init(&session);
-    /* AUTO picks shared memory when it can, which is what makes a
-     * full-terminal camera view affordable at all. */
-    options.framebuffer.transport = KITTYFB_TRANSPORT_AUTO;
-    /*
-     * Let the framebuffer use the whole terminal.  The library's defaults
-     * cap it at 1600x1000, which suits a game with a fixed art scale but
-     * leaves a camera view boxed inside a black border on any larger
-     * screen - and worse, letterboxes the picture a second time inside
-     * that box, so the aspect is right but half the display is wasted.
-     */
-    options.framebuffer.max_width = 7680;
-    options.framebuffer.max_height = 4320;
-
-    if (kittyts_start(&session, STDIN_FILENO, STDOUT_FILENO, &options) != 0) {
-        if (errno == ENOTSUP) {
-            (void)fprintf(stderr,
-                "kilix-rtsp: this terminal answered the device query but does\n"
-                "            not speak the Kitty graphics protocol.\n");
-        } else {
-            perror("kilix-rtsp: cannot start the terminal session");
-        }
+    if (!start_terminal(&session)) {
         return 1;
     }
-    g_session = &session;
-    (void)signal(SIGSEGV, handle_fatal);
-    (void)signal(SIGBUS, handle_fatal);
-    (void)signal(SIGABRT, handle_fatal);
-    (void)signal(SIGINT, handle_interrupt);
-    (void)signal(SIGTERM, handle_interrupt);
-    (void)signal(SIGPIPE, SIG_IGN);
 
     width = kittyts_width(&session);
     height = kittyts_height(&session);
@@ -289,20 +322,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
             }
         }
 
-        (void)kittyts_read_input(&session);
-        {
-            kittyin_event event;
-
-            while (kittyts_next_event(&session, &event)) {
-                if (event.kind == KITTYIN_EVENT_KEY &&
-                    event.data.key.action != KITTYKB_ACTION_RELEASE &&
-                    (event.data.key.key == 'q' ||
-                     event.data.key.key == 'Q' ||
-                     event.data.key.key == 27u)) {
-                    g_quit = 1;
-                }
-            }
-        }
+        consume_input(&session);
         if (g_quit) {
             break;
         }
@@ -352,20 +372,32 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
             }
             last_sequence = stats.frames;
 
-            memcpy(present_buffer, pixels,
-                   (size_t)width * (size_t)height * 4u);
-            krtsp_source_release(source);
-
-            sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
-                           width, height);
             if (degraded) {
+                /* Drawing over the frame needs a private copy: the
+                 * borrowed buffer belongs to the source. */
+                memcpy(present_buffer, pixels,
+                       (size_t)width * (size_t)height * 4u);
+                krtsp_source_release(source);
+                sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
+                               width, height);
                 (void)snprintf(banner, sizeof(banner), "%s  %s  %.1fs old",
                                label, krtsp_status_name(status),
                                (double)age_ms / 1000.0);
                 draw_banner(&canvas, banner, status_accent(status));
+                (void)sr_pack_rgba(&canvas, present_buffer,
+                                   (size_t)width * (size_t)height * 4u);
+            } else {
+                /* Nothing is drawn over a healthy frame, so pack straight
+                 * out of the borrowed buffer.  sr_pack_rgba() takes a
+                 * const canvas and writes elsewhere, so this skips a
+                 * full-frame copy - 7.7 MB per frame at full screen - in
+                 * the case that runs essentially all the time. */
+                sr_canvas_wrap(&canvas, (uint32_t *)(void *)(uintptr_t)pixels,
+                               width, height);
+                (void)sr_pack_rgba(&canvas, present_buffer,
+                                   (size_t)width * (size_t)height * 4u);
+                krtsp_source_release(source);
             }
-            (void)sr_pack_rgba(&canvas, present_buffer,
-                               (size_t)width * (size_t)height * 4u);
             if (!kittyts_present(&session, present_buffer, width, height)) {
                 exit_code = 1;
                 break;
@@ -432,7 +464,6 @@ static void mosaic_stop_sources(mosaic_slot *slots, size_t count)
 int krtsp_mosaic_run(
     const char **urls, const char **labels, size_t count, int fps_cap)
 {
-    kittyts_options options;
     kittyts_session session;
     mosaic_slot slots[KRTSP_MOSAIC_MAX];
     krtsp_tile tiles[KRTSP_MOSAIC_MAX];
@@ -453,29 +484,9 @@ int krtsp_mosaic_run(
     }
     (void)memset(slots, 0, sizeof(slots));
 
-    kittyts_options_init(&options);
-    kittyts_session_init(&session);
-    options.framebuffer.transport = KITTYFB_TRANSPORT_AUTO;
-    options.framebuffer.max_width = 7680;
-    options.framebuffer.max_height = 4320;
-
-    if (kittyts_start(&session, STDIN_FILENO, STDOUT_FILENO, &options) != 0) {
-        if (errno == ENOTSUP) {
-            (void)fprintf(stderr,
-                "kilix-rtsp: this terminal does not speak the Kitty graphics "
-                "protocol.\n");
-        } else {
-            perror("kilix-rtsp: cannot start the terminal session");
-        }
+    if (!start_terminal(&session)) {
         return 1;
     }
-    g_session = &session;
-    (void)signal(SIGSEGV, handle_fatal);
-    (void)signal(SIGBUS, handle_fatal);
-    (void)signal(SIGABRT, handle_fatal);
-    (void)signal(SIGINT, handle_interrupt);
-    (void)signal(SIGTERM, handle_interrupt);
-    (void)signal(SIGPIPE, SIG_IGN);
 
     width = kittyts_width(&session);
     height = kittyts_height(&session);
@@ -561,20 +572,7 @@ int krtsp_mosaic_run(
             }
         }
 
-        (void)kittyts_read_input(&session);
-        {
-            kittyin_event event;
-
-            while (kittyts_next_event(&session, &event)) {
-                if (event.kind == KITTYIN_EVENT_KEY &&
-                    event.data.key.action != KITTYKB_ACTION_RELEASE &&
-                    (event.data.key.key == 'q' ||
-                     event.data.key.key == 'Q' ||
-                     event.data.key.key == 27u)) {
-                    g_quit = 1;
-                }
-            }
-        }
+        consume_input(&session);
         if (g_quit) {
             break;
         }
