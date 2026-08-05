@@ -8,6 +8,15 @@
 #      ~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf
 #   chmod 600 ~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf
 #
+# PASSWORDS CONTAINING / ? OR # MUST BE PERCENT-ENCODED HERE.
+#
+#   /  ->  %2F      ?  ->  %3F      #  ->  %23
+#
+# Those three characters end the URL's authority, so "rtsp://u:a/b@host/1"
+# genuinely means user "u", no password, host "u", path "/b@host/1" - every
+# conforming URL parser reads it that way, and nothing downstream can recover
+# what was meant. '@' and ':' are handled automatically and need no encoding.
+#
 # Each camera carries a full URL per tier. Tiers are NOT synthesized from one
 # another: device families use incompatible path conventions, and some use a
 # non-standard port. Give both URLs explicitly.

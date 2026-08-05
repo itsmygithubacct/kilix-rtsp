@@ -303,6 +303,111 @@ test_url_redaction(void)
     return true;
 }
 
+static bool
+test_password_escaping(void)
+{
+    char out[512];
+
+    /* An unescaped '@' in a password ends the userinfo early: ffmpeg
+     * parses "ss@203.0.113.9" as the host and reports a connection error
+     * naming somewhere that does not exist.  That reads as a network
+     * fault, which is why this has to be handled rather than diagnosed. */
+    CHECK(krtsp_url_escape_password("rtsp://u:p@ss@203.0.113.9/1", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://u:p%40ss@203.0.113.9/1") == 0);
+
+    /* ':' is recoverable: the first ':' in the authority separates user
+     * from password, so any later one is part of the password. */
+    CHECK(krtsp_url_escape_password("rtsp://u:a:b@203.0.113.9/1", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://u:a%3Ab@203.0.113.9/1") == 0);
+
+    /*
+     * '/' '?' and '#' are NOT recoverable, and pretending otherwise
+     * would be worse than leaving them alone.  Each ends the authority,
+     * so "rtsp://u:a/b@host/1" genuinely parses as user "u", no
+     * password, host "u", path "/b@host/1" - Python's urlsplit and every
+     * other conforming parser agree.  No amount of cleverness can tell
+     * that apart from a URL that really does have a path.
+     *
+     * So the URL is passed through unchanged and the operator must
+     * percent-encode those characters in the configuration file.  The
+     * alternative - scanning for the last '@' anywhere in the string -
+     * misparses "rtsp://host:554/live@2" as a password of "554/live",
+     * which is a real URL shape.
+     */
+    CHECK(krtsp_url_escape_password("rtsp://u:a/b@203.0.113.9/1", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://u:a/b@203.0.113.9/1") == 0);
+    CHECK(krtsp_url_escape_password("rtsp://u:a?c@203.0.113.9/1", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://u:a?c@203.0.113.9/1") == 0);
+
+    /* A host:port followed by a path containing '@' must never be read
+     * as userinfo. */
+    CHECK(krtsp_url_escape_password("rtsp://host:554/live@2", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://host:554/live@2") == 0);
+
+    /* Unreserved characters are left alone, so an ordinary password stays
+     * readable in a process listing and in a log. */
+    CHECK(krtsp_url_escape_password("rtsp://u:Aa0-._~@203.0.113.9/1", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://u:Aa0-._~@203.0.113.9/1") == 0);
+
+    /* A space becomes %20, not '+': in userinfo a '+' is a literal plus,
+     * so form encoding would silently change the password. */
+    CHECK(krtsp_url_escape_password("rtsp://u:a b@203.0.113.9/1", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://u:a%20b@203.0.113.9/1") == 0);
+
+    /* Nothing to do when there is no password, or no userinfo at all. */
+    CHECK(krtsp_url_escape_password("rtsp://admin@203.0.113.9/1", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://admin@203.0.113.9/1") == 0);
+    CHECK(krtsp_url_escape_password("rtsp://203.0.113.9/live", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://203.0.113.9/live") == 0);
+
+    /* An '@' in the path is not userinfo. */
+    CHECK(krtsp_url_escape_password("rtsp://203.0.113.9/live@2", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://203.0.113.9/live@2") == 0);
+
+    /* Too small fails empty rather than emitting a half-escaped URL,
+     * which would connect somewhere unintended. */
+    CHECK(!krtsp_url_escape_password("rtsp://u:p@ss@203.0.113.9/1", out, 12u));
+    CHECK(out[0] == '\0');
+    CHECK(!krtsp_url_escape_password(NULL, out, sizeof(out)));
+    return true;
+}
+
+static bool
+test_argv_escapes_the_url(void)
+{
+    krtsp_args_request request;
+    size_t count;
+    bool found = false;
+
+    /* The builder must apply escaping itself: a caller that forgets gets
+     * a confusing connection error rather than an obvious mistake. */
+    krtsp_args_request_init(&request);
+    request.url = "rtsp://u:p@ss@203.0.113.9:554/ch1";
+    count = krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
+                             sizeof(storage));
+    CHECK(count > 0u);
+    CHECK(has_pair(count, "-i", "rtsp://u:p%40ss@203.0.113.9:554/ch1"));
+
+    /* The raw form must not survive anywhere in the argv. */
+    for (size_t index = 0u; index < count; ++index) {
+        if (strcmp(argv[index], request.url) == 0) {
+            found = true;
+        }
+    }
+    CHECK(!found);
+    return true;
+}
+
 typedef bool (*test_function)(void);
 
 typedef struct test_case {
@@ -321,7 +426,9 @@ main(void)
         {"low latency off", test_low_latency_off},
         {"legacy timeout flag", test_legacy_timeout_flag},
         {"rejections", test_rejections},
-        {"url redaction", test_url_redaction}
+        {"url redaction", test_url_redaction},
+        {"password escaping", test_password_escaping},
+        {"argv escapes the url", test_argv_escapes_the_url}
     };
     size_t passed = 0u;
 
