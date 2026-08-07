@@ -53,6 +53,14 @@ static size_t count_arg(size_t count, const char *needle)
     return found;
 }
 
+/* Rebuild into the shared argv/storage; every role test compares the
+ * argv the library would actually spawn. */
+static size_t build(const krtsp_args_request *request)
+{
+    return krtsp_build_argv(request, argv, KRTSP_ARGV_MAX, storage,
+                            sizeof(storage));
+}
+
 static bool
 test_defaults(void)
 {
@@ -408,6 +416,187 @@ test_argv_escapes_the_url(void)
     return true;
 }
 
+/* The record sink exists so one ffmpeg, on one RTSP session, can feed a
+ * viewer and write an archive.  These pin the argv it produces. */
+static bool
+test_record_role_adds_a_copy_sink(void)
+{
+    krtsp_args_request request;
+    size_t count;
+
+    krtsp_args_request_init(&request);
+    request.url = sample_url;
+    request.width = 640;
+    request.height = 360;
+    request.roles = (unsigned)KRTSP_ROLE_DECODE | (unsigned)KRTSP_ROLE_RECORD;
+    request.record_dir = "/tmp/rec";
+    count = build(&request);
+    CHECK(count > 0u);
+
+    /* Both sinks on one input: the decode pipe survives untouched... */
+    CHECK(has_pair(count, "-f", "rawvideo"));
+    CHECK(has_arg(count, "-"));
+    /* ...and the archive copies rather than re-encodes, which is the
+     * whole point: re-encoding at the same resolution measurably
+     * produces larger files for a core's worth of CPU. */
+    CHECK(has_pair(count, "-c", "copy"));
+    CHECK(has_pair(count, "-f", "segment"));
+    CHECK(has_pair(count, "-segment_time", "10"));
+    CHECK(has_pair(count, "-reset_timestamps", "1"));
+    CHECK(has_pair(count, "-strftime", "1"));
+    CHECK(has_pair(count, "-map", "0:v"));
+    /* one input only, so exactly one -i */
+    CHECK(count_arg(count, "-i") == 1u);
+    return true;
+}
+
+static bool
+test_record_only_never_decodes(void)
+{
+    krtsp_args_request request;
+    size_t count;
+
+    krtsp_args_request_init(&request);
+    request.url = sample_url;
+    request.roles = (unsigned)KRTSP_ROLE_RECORD;
+    request.record_dir = "/tmp/rec";
+    count = build(&request);
+    CHECK(count > 0u);
+
+    /* No decode sink at all: this camera costs I/O and nothing else. */
+    CHECK(!has_pair(count, "-f", "rawvideo"));
+    CHECK(!has_arg(count, "-pix_fmt"));
+    CHECK(!has_arg(count, "-vf"));
+    CHECK(has_pair(count, "-f", "segment"));
+
+    /* Low-latency input flags trade buffering for promptness, which an
+     * archive has no use for and something to lose by. */
+    CHECK(!has_pair(count, "-fflags", "nobuffer"));
+    CHECK(!has_pair(count, "-flags", "low_delay"));
+    return true;
+}
+
+static bool
+test_record_audio_and_container(void)
+{
+    krtsp_args_request request;
+    size_t count;
+
+    krtsp_args_request_init(&request);
+    request.url = sample_url;
+    request.roles = (unsigned)KRTSP_ROLE_RECORD;
+    request.record_dir = "/tmp/rec";
+    count = build(&request);
+    CHECK(count > 0u);
+    /* Video only by default: pairing audio with the wrong container fails
+     * the whole process rather than just the audio. */
+    CHECK(has_pair(count, "-map", "0:v"));
+    CHECK(!has_pair(count, "-map", "0:a?"));
+    /* Default pattern is Matroska and flat, both deliberately: mp4 cannot
+     * mux the pcm_alaw these cameras carry, and a flat pattern needs no
+     * directory creation, which not every ffmpeg can do. */
+    CHECK(has_arg(count, "/tmp/rec/%Y-%m-%d_%H.%M.%S.mkv"));
+
+    request.record_audio = true;
+    count = build(&request);
+    CHECK(count > 0u);
+    /* '?' so a camera without an audio track still records. */
+    CHECK(has_pair(count, "-map", "0:a?"));
+
+    request.record_pattern = "%Y/%m/%d.mkv";
+    request.segment_seconds = 30;
+    count = build(&request);
+    CHECK(count > 0u);
+    CHECK(has_arg(count, "/tmp/rec/%Y/%m/%d.mkv"));
+    CHECK(has_pair(count, "-segment_time", "30"));
+    return true;
+}
+
+/* -strftime_mkdir does not exist in every ffmpeg - 5.1 lacks it - and
+ * passing a flag the binary does not know fails the spawn outright.  It
+ * is emitted only when the caller reports the binary has it. */
+static bool
+test_segment_mkdir_is_opt_in(void)
+{
+    krtsp_args_request request;
+    size_t count;
+
+    krtsp_args_request_init(&request);
+    request.url = sample_url;
+    request.roles = (unsigned)KRTSP_ROLE_RECORD;
+    request.record_dir = "/tmp/rec";
+    count = build(&request);
+    CHECK(count > 0u);
+    CHECK(!has_arg(count, "-strftime_mkdir"));
+
+    request.segment_mkdir = true;
+    count = build(&request);
+    CHECK(count > 0u);
+    CHECK(has_pair(count, "-strftime_mkdir", "1"));
+    return true;
+}
+
+static bool
+test_segment_list_is_opt_in(void)
+{
+    krtsp_args_request request;
+    size_t count;
+
+    krtsp_args_request_init(&request);
+    request.url = sample_url;
+    request.roles = (unsigned)KRTSP_ROLE_RECORD;
+    request.record_dir = "/tmp/rec";
+    count = build(&request);
+    CHECK(count > 0u);
+    CHECK(!has_arg(count, "-segment_list"));
+
+    request.segment_list = "/tmp/rec/.segments";
+    count = build(&request);
+    CHECK(count > 0u);
+    CHECK(has_pair(count, "-segment_list", "/tmp/rec/.segments"));
+    /* Bounded: a supervisor stats this for liveness, and it must not grow
+     * without limit over a month of uptime. */
+    CHECK(has_pair(count, "-segment_list_size", "8"));
+    CHECK(has_pair(count, "-segment_list_flags", "+live"));
+    return true;
+}
+
+static bool
+test_role_rejections(void)
+{
+    krtsp_args_request request;
+
+    krtsp_args_request_init(&request);
+    request.url = sample_url;
+    request.width = 640;
+    request.height = 360;
+
+    /* A recording sink with nowhere to write would spawn a process
+     * guaranteed to fail; refusing reports it as the configuration error
+     * it is. */
+    request.roles = (unsigned)KRTSP_ROLE_RECORD;
+    request.record_dir = NULL;
+    CHECK(build(&request) == 0u);
+    request.record_dir = "";
+    CHECK(build(&request) == 0u);
+
+    request.record_dir = "/tmp/rec";
+    request.segment_seconds = -1;
+    CHECK(build(&request) == 0u);
+    request.segment_seconds = 0;
+
+    /* An unknown role bit is a caller error, not something to ignore. */
+    request.roles = 0x80u;
+    CHECK(build(&request) == 0u);
+
+    /* Zero means decode, which is what every caller predating the record
+     * sink asked for. */
+    request.roles = 0u;
+    CHECK(build(&request) > 0u);
+    CHECK(has_pair(build(&request), "-f", "rawvideo"));
+    return true;
+}
+
 typedef bool (*test_function)(void);
 
 typedef struct test_case {
@@ -426,6 +615,12 @@ main(void)
         {"low latency off", test_low_latency_off},
         {"legacy timeout flag", test_legacy_timeout_flag},
         {"rejections", test_rejections},
+        {"record role adds a copy sink", test_record_role_adds_a_copy_sink},
+        {"record only never decodes", test_record_only_never_decodes},
+        {"record audio and container", test_record_audio_and_container},
+        {"segment mkdir is opt in", test_segment_mkdir_is_opt_in},
+        {"segment list is opt in", test_segment_list_is_opt_in},
+        {"role rejections", test_role_rejections},
         {"url redaction", test_url_redaction},
         {"password escaping", test_password_escaping},
         {"argv escapes the url", test_argv_escapes_the_url}

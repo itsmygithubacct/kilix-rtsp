@@ -51,6 +51,13 @@ void krtsp_args_request_init(krtsp_args_request *request)
     request->letterbox = false;
     request->pixfmt = KRTSP_PIXFMT_RGBA;
     request->legacy_timeout_flag = false;
+    request->roles = (unsigned)KRTSP_ROLE_DECODE;
+    request->record_dir = NULL;
+    request->record_pattern = NULL;
+    request->segment_seconds = 0;
+    request->record_audio = false;
+    request->segment_mkdir = false;
+    request->segment_list = NULL;
 }
 
 /* Append one NUL-terminated argument, pointing the next argv slot at it. */
@@ -117,6 +124,7 @@ size_t krtsp_build_argv(
 {
     arg_writer writer;
     bool scaling;
+    unsigned roles;
 
     if (request == NULL || argv == NULL || storage == NULL ||
         argv_capacity == 0u || storage_capacity == 0u) {
@@ -132,6 +140,23 @@ size_t krtsp_build_argv(
     }
     if (request->width < 0 || request->height < 0 || request->fps_cap < 0) {
         return 0u;
+    }
+    roles = request->roles != 0u ? request->roles
+                                 : (unsigned)KRTSP_ROLE_DECODE;
+    {
+        if ((roles & ~(unsigned)(KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD)) != 0u) {
+            return 0u;
+        }
+        /* A recording sink with nowhere to write is a request that would
+         * spawn a process guaranteed to fail; refusing here reports it as
+         * the configuration error it is. */
+        if ((roles & (unsigned)KRTSP_ROLE_RECORD) != 0u &&
+            (request->record_dir == NULL || request->record_dir[0] == '\0')) {
+            return 0u;
+        }
+        if (request->segment_seconds < 0) {
+            return 0u;
+        }
     }
 
     writer.argv = argv;
@@ -167,7 +192,12 @@ size_t krtsp_build_argv(
     push_arg(&writer, "make_zero");
     push_arg(&writer, "-fflags");
     push_arg(&writer, "+genpts+discardcorrupt");
-    if (request->low_latency) {
+    /* Low-latency input flags trade buffering for promptness, which is
+     * right for a view and wrong for an archive: a record-only process
+     * has no latency to save and integrity to lose.  Honour the request
+     * only when something is actually being displayed. */
+    if (request->low_latency &&
+        (roles & (unsigned)KRTSP_ROLE_DECODE) != 0u) {
         push_arg(&writer, "-fflags");
         push_arg(&writer, "nobuffer");
         push_arg(&writer, "-flags");
@@ -190,9 +220,13 @@ size_t krtsp_build_argv(
         push_arg(&writer, escaped);
     }
 
-    /* Output.  Audio is dropped: playback is a later concern and a
-     * camera's audio track otherwise has to be muxed or discarded
-     * downstream anyway. */
+    /*
+     * The decode sink.  Audio is dropped here: this output exists to feed
+     * pixels to a frame ring, and a camera's audio track would have to be
+     * discarded downstream anyway.  The record sink below keeps it when
+     * asked.
+     */
+    if ((roles & (unsigned)KRTSP_ROLE_DECODE) != 0u) {
     push_arg(&writer, "-an");
     push_arg(&writer, "-f");
     push_arg(&writer, "rawvideo");
@@ -243,6 +277,68 @@ size_t krtsp_build_argv(
     /* Frames go to stdout, where a fixed pixel format makes the pipe
      * self-framing. */
     push_arg(&writer, "-");
+    }
+
+    /*
+     * The record sink.  One process, one RTSP session, a second output:
+     * this is what lets a camera feed detection and archive itself
+     * without opening a connection twice.
+     *
+     * -c copy is not an optimisation, it is the whole point.  The camera
+     * already encoded these bytes; re-encoding them at the same
+     * resolution measurably produces *larger* files while burning a core
+     * to do it.  Copying costs neither.
+     */
+    if ((roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
+        const char *pattern = request->record_pattern != NULL &&
+                                      request->record_pattern[0] != '\0'
+                                  ? request->record_pattern
+                                  : "%Y-%m-%d_%H.%M.%S.mkv";
+        int seconds = request->segment_seconds > 0
+                          ? request->segment_seconds
+                          : 10;
+
+        push_arg(&writer, "-map");
+        push_arg(&writer, "0:v");
+        if (request->record_audio) {
+            /* '?' keeps a camera with no audio track from failing the
+             * whole process. */
+            push_arg(&writer, "-map");
+            push_arg(&writer, "0:a?");
+        }
+        push_arg(&writer, "-c");
+        push_arg(&writer, "copy");
+        push_arg(&writer, "-f");
+        push_arg(&writer, "segment");
+        push_arg(&writer, "-segment_time");
+        push_format(&writer, "%d", seconds);
+        /* Each segment starts at zero, so a file is playable alone rather
+         * than only as part of the sequence that preceded it. */
+        push_arg(&writer, "-reset_timestamps");
+        push_arg(&writer, "1");
+        push_arg(&writer, "-strftime");
+        push_arg(&writer, "1");
+        if (request->segment_list != NULL &&
+            request->segment_list[0] != '\0') {
+            /* Bounded and rewritten in place: a supervisor stats this one
+             * file to know recording is alive, and it must not grow
+             * without limit over a month of uptime. */
+            push_arg(&writer, "-segment_list");
+            push_arg(&writer, request->segment_list);
+            push_arg(&writer, "-segment_list_size");
+            push_arg(&writer, "8");
+            push_arg(&writer, "-segment_list_flags");
+            push_arg(&writer, "+live");
+        }
+        /* Only when the binary has it.  A hierarchical pattern needs the
+         * muxer to create directories, and passing the flag to an ffmpeg
+         * without it is an unrecognised-option failure at spawn. */
+        if (request->segment_mkdir) {
+            push_arg(&writer, "-strftime_mkdir");
+            push_arg(&writer, "1");
+        }
+        push_format(&writer, "%s/%s", request->record_dir, pattern);
+    }
 
     if (writer.failed) {
         return 0u;

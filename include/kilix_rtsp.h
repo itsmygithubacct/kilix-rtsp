@@ -61,6 +61,25 @@ typedef enum krtsp_pixfmt {
     KRTSP_PIXFMT_BGRA        /* straight into an sr_canvas on little-endian */
 } krtsp_pixfmt;
 
+/*
+ * What one ffmpeg process is being asked to do with the stream.
+ *
+ * A bitmask rather than a mode, because all three combinations are real:
+ * a camera that only feeds detection and a live view, one that only
+ * archives, and one that does both.  The last is the reason this is not
+ * two processes - many devices refuse a second concurrent RTSP session,
+ * and decoding is expensive enough that doing it twice to serve two
+ * consumers is the largest avoidable cost in the system.
+ *
+ * KRTSP_ROLE_RECORD alone never decodes at all: the segmenter copies the
+ * camera's own bitstream to disk, so the process costs I/O and nothing
+ * else.  That is the cheapest camera this library can run.
+ */
+typedef enum krtsp_role {
+    KRTSP_ROLE_DECODE = 1 << 0,   /* rawvideo to the pipe (the default) */
+    KRTSP_ROLE_RECORD = 1 << 1    /* -c copy segments to a directory */
+} krtsp_role;
+
 typedef struct krtsp_args_request {
     /* Full RTSP URL, credentials included.  See the note on secrets in
      * krtsp_url_redact(). */
@@ -99,12 +118,62 @@ typedef struct krtsp_args_request {
      * 59, -timeout from 59 on.  Default false selects -timeout.
      * krtsp_source probes the binary once and sets this. */
     bool legacy_timeout_flag;
+
+    /* Bitmask of krtsp_role.  Zero means KRTSP_ROLE_DECODE, which is what
+     * every caller predating the record sink asked for. */
+    unsigned roles;
+
+    /*
+     * KRTSP_ROLE_RECORD only.  Segments land at record_dir/record_pattern,
+     * where the pattern is strftime and its extension picks the container.
+     *
+     * The container matters more than it looks.  Cameras commonly carry
+     * pcm_alaw audio, which mp4 cannot mux at all - `-c copy` fails
+     * outright - while MPEG-TS accepts it and silently drops the audio
+     * stream.  Matroska carries it untouched and tolerates a segment
+     * truncated by a power cut, which mp4 does not.  Hence the .mkv
+     * default.
+     *
+     * NULL pattern means "%Y-%m-%d_%H.%M.%S.mkv" - flat, because that
+     * works on every ffmpeg.  A pattern containing '/' builds a date
+     * hierarchy instead, which is nicer to prune and to browse, but needs
+     * the muxer to create directories: see segment_mkdir.
+     *
+     * segment_seconds <= 0 means 10.
+     */
+    const char *record_dir;
+    const char *record_pattern;
+    int segment_seconds;
+
+    /*
+     * Copy the audio track as well as video.  Off by default: it is only
+     * safe once the container can carry whatever codec the camera uses,
+     * and a wrong pairing fails the whole process rather than the audio.
+     * The map is optional, so a camera without audio still records.
+     */
+    bool record_audio;
+
+    /* Emit -strftime_mkdir, so a pattern containing '/' creates its
+     * directories.  Not universal - ffmpeg 5.1 lacks it - so this must be
+     * set from krtsp_ffmpeg_supports_segment_mkdir() rather than assumed.
+     * krtsp_source probes once and sets it. */
+    bool segment_mkdir;
+
+    /*
+     * Optional manifest ffmpeg rewrites as each segment completes.
+     *
+     * It exists so a supervisor can tell whether recording is still
+     * happening by stat'ing one file, instead of walking a directory tree
+     * that may hold a hundred thousand segments.  Bounded to the most
+     * recent few entries; it is a liveness signal, not an index.
+     */
+    const char *segment_list;
 } krtsp_args_request;
 
 /* Bounds for krtsp_build_argv() callers sizing their own storage.
  * Storage allows for password escaping, which can triple the length of
  * the userinfo, on top of the 512-byte URL a source accepts. */
-#define KRTSP_ARGV_MAX 40
+#define KRTSP_ARGV_MAX 64
 #define KRTSP_ARGV_STORAGE_MAX 2048
 
 void krtsp_args_request_init(krtsp_args_request *request);
@@ -164,20 +233,74 @@ bool krtsp_url_escape_password(const char *url, char *out, size_t capacity);
  * is the only thing a live camera view is for.  It mirrors the policy
  * kitty-framebuffer already applies to its own pending slot.
  *
- * Three buffers: the producer owns one outright, the consumer owns one
- * outright, and a single shared slot is exchanged under the lock.  Two
- * buffers cannot be made safe here - the producer necessarily holds its
- * buffer pointer across the lock while it fills the frame, so any
- * consumer-side swap rewrites that pointer under it.
+ * The buffers are a ring of slots addressed by index.  Sizing is forced:
  *
- * The lock covers two pointer exchanges and some counters, and is never
- * held across a read from the camera or a write to the terminal, which
- * would couple them and let a slow terminal stall capture.
+ *     1 slot the producer is filling
+ *   + 1 slot holding the newest published frame
+ *   + 1 slot per reader currently holding a borrow
+ *
+ * Two buffers cannot be made safe at all - the producer necessarily holds
+ * its buffer across the lock while it fills the frame, so a consumer-side
+ * exchange rewrites it underneath.  Three is the minimum, and is what a
+ * private ring uses.
+ *
+ * The lock covers index and counter updates only, and is never held
+ * across a read from the camera or a write to the terminal, which would
+ * couple them and let a slow reader stall capture.
  */
+/* Shared-ring object names: the prefix keeps ours out of every other
+ * program's flat POSIX shm namespace and makes leaked objects
+ * identifiable in /dev/shm. */
+#define KRTSP_FRAME_NAME_PREFIX "/kilix-rtsp-"
+#define KRTSP_FRAME_NAME_MAX 96
+
 typedef struct krtsp_frame krtsp_frame;
 
-/* Allocate all three buffers at width * height * 4 bytes. */
+/* Private ring: three slots of width * height * 4 bytes, this process
+ * only.  Correct for a single viewer, and the cheapest option. */
 bool krtsp_frame_init(krtsp_frame **frame, int width, int height);
+
+/*
+ * Shared ring: the same policy in a POSIX shared-memory object, so other
+ * processes can read the frames this one decodes.
+ *
+ * Decoding is the most expensive thing in this library - a full-screen
+ * source runs 21-44% of a core - so a second consumer that decodes its
+ * own copy doubles the largest cost in the system to produce bytes that
+ * already exist.  Two viewers on one camera do exactly that today.  It
+ * also keeps the camera to a single RTSP session, which matters because
+ * some devices refuse concurrent ones.
+ *
+ * `name` is a leaf, not a path: it is prefixed to form the object name,
+ * and must not contain '/', a backslash, or whitespace.  One producer
+ * owns a given name; creating over an existing object treats it as a leak
+ * from a dead run and replaces it.
+ *
+ * `max_readers` is how many consumers may hold a borrow *at the same
+ * time*, not how many may attach - readers that borrow and release
+ * promptly share far fewer slots than their number.  It sizes the ring at
+ * max_readers + 2, and krtsp_frame_borrow() refuses beyond it rather than
+ * overwriting a slot somebody is reading.
+ *
+ * Frames are not authenticated.  Anything able to open the object can
+ * read the camera's pixels, so the object is created 0600 and the same
+ * reasoning that keeps camera URLs out of world-readable files applies.
+ */
+bool krtsp_frame_init_shared(krtsp_frame **frame, const char *name,
+                             int width, int height, int max_readers);
+
+/*
+ * Attach to a ring some other process created.  Fails when the object is
+ * missing, was built by an incompatible version, or is not a ring at all.
+ *
+ * A reader gets the same borrow/release contract as an in-process
+ * consumer.  It never unlinks the object: the producer owns that.
+ */
+bool krtsp_frame_attach(krtsp_frame **frame, const char *name);
+
+/* The full object name of a shared ring, or NULL for a private one. */
+const char *krtsp_frame_name(const krtsp_frame *frame);
+
 void krtsp_frame_free(krtsp_frame *frame);
 
 /*
@@ -281,6 +404,41 @@ typedef struct krtsp_source_options {
      * override matters on hosts carrying a vendor build with different
      * codec support than the distribution's. */
     const char *ffmpeg_path;
+
+    /*
+     * Bitmask of krtsp_role; zero means KRTSP_ROLE_DECODE.  With
+     * KRTSP_ROLE_RECORD the same process also writes -c copy segments,
+     * which is how one RTSP session serves both a viewer and an archive.
+     *
+     * KRTSP_ROLE_RECORD without KRTSP_ROLE_DECODE never decodes, so
+     * krtsp_frame_borrow() will never return anything and the source
+     * costs only I/O.
+     */
+    unsigned roles;
+
+    /* Recording target; see the matching fields on krtsp_args_request.
+     * record_dir is required whenever KRTSP_ROLE_RECORD is set.  The
+     * segment_mkdir capability is probed from the binary, so a
+     * hierarchical pattern works where the binary supports it. */
+    const char *record_dir;
+    const char *record_pattern;
+    int segment_seconds;
+    bool record_audio;
+
+    /*
+     * No new segment for this long, after the grace period, means the
+     * recording sink has wedged: kill and restart.
+     *
+     * Separate from stall_ms because the two failures are genuinely
+     * independent - a camera can deliver frames while its segmenter is
+     * stuck on a full disk, and can write segments while the decode pipe
+     * has stopped.  Collapsing them into one timer loses the ability to
+     * say which broke.
+     *
+     * Default 0 selects three segment lengths, which tolerates one missed
+     * rotation without tolerating a dead sink.
+     */
+    int segment_stall_ms;
 } krtsp_source_options;
 
 void krtsp_source_options_init(krtsp_source_options *options);
@@ -308,7 +466,17 @@ void krtsp_source_stop(krtsp_source *source);
 const uint8_t *krtsp_source_borrow(krtsp_source *source, int *age_ms);
 void krtsp_source_release(krtsp_source *source);
 
+/*
+ * Overall health: the more severe of the roles in use, so a source whose
+ * segmenter has wedged does not report "online" because pixels are still
+ * arriving.  For a decode-only source this is exactly what it always was.
+ */
 krtsp_status krtsp_source_status(const krtsp_source *source);
+
+/* Health of one role.  A role the source is not running reports
+ * KRTSP_OFFLINE rather than pretending to be healthy. */
+krtsp_status krtsp_source_role_status(
+    const krtsp_source *source, krtsp_role role);
 const char *krtsp_status_name(krtsp_status status);
 
 typedef struct krtsp_source_stats {
@@ -328,6 +496,18 @@ void krtsp_source_get_stats(
  * krtsp_source_start() applies it automatically.
  */
 bool krtsp_ffmpeg_needs_legacy_timeout(const char *ffmpeg_path);
+
+/*
+ * Whether this ffmpeg's segment muxer can create the directories a
+ * strftime pattern names (-strftime_mkdir).  ffmpeg 5.1 cannot.
+ *
+ * A recording pattern containing '/' needs this, and without it every
+ * segment fails once the hour rolls over - silently, until an entire
+ * hour of footage is missing.  krtsp_source probes once and passes the
+ * flag only when it is real; a caller choosing a hierarchical pattern
+ * should check the same thing rather than discover it overnight.
+ */
+bool krtsp_ffmpeg_supports_segment_mkdir(const char *ffmpeg_path);
 
 /* ------------------------- paths and configuration ---------------------- */
 

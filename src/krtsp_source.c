@@ -51,6 +51,16 @@ struct krtsp_source {
     krtsp_frame *frame;
     size_t frame_size;
 
+    unsigned roles;
+    bool segment_mkdir;
+    char segment_list[512];        /* manifest ffmpeg rewrites per segment */
+    /* The manifest's own mtime is wall-clock; when we last saw it change
+     * is monotonic.  Only the second can be compared against the tick,
+     * and mixing them is how a clock adjustment becomes a restart loop. */
+    long long segment_mtime;          /* supervisor thread only */
+    _Atomic long long segment_seen_ms;
+    _Atomic int record_status;
+
     pthread_t supervisor;
     pthread_t reader;
     bool supervisor_started;
@@ -102,6 +112,12 @@ void krtsp_source_options_init(krtsp_source_options *options)
     options->max_consecutive_failures = 0;
     options->log_path = NULL;
     options->ffmpeg_path = NULL;
+    options->roles = (unsigned)KRTSP_ROLE_DECODE;
+    options->record_dir = NULL;
+    options->record_pattern = NULL;
+    options->segment_seconds = 0;
+    options->record_audio = false;
+    options->segment_stall_ms = 0;
 }
 
 const char *krtsp_status_name(krtsp_status status)
@@ -117,6 +133,55 @@ const char *krtsp_status_name(krtsp_status status)
 }
 
 /* ---------------------------- ffmpeg probing ---------------------------- */
+
+/*
+ * Does this ffmpeg's segment muxer create the directories a strftime
+ * pattern names?
+ *
+ * It matters because the natural recording layout is a date hierarchy -
+ * one directory per day, one per hour - and the segment muxer will not
+ * make those itself unless it has -strftime_mkdir.  Without it, every
+ * segment fails with "No such file or directory" the moment the hour
+ * rolls over, and the first failure is at whatever hour the operator was
+ * not watching.
+ *
+ * Not universal: ffmpeg 5.1 has -strftime but not -strftime_mkdir.
+ * Probed rather than assumed, because the failure is silent until it is
+ * an entire missing hour of footage.
+ */
+bool krtsp_ffmpeg_supports_segment_mkdir(const char *ffmpeg_path)
+{
+    char command[512];
+    char line[256];
+    FILE *pipe_handle;
+    bool supported = false;
+
+    if (ffmpeg_path == NULL || ffmpeg_path[0] == '\0') {
+        ffmpeg_path = "ffmpeg";
+    }
+    if (snprintf(command, sizeof(command),
+                 "%s -hide_banner -h muxer=segment 2>/dev/null",
+                 ffmpeg_path) < 0) {
+        return false;
+    }
+    pipe_handle = popen(command, "r");
+    if (pipe_handle == NULL) {
+        return false;
+    }
+    /* Bounded for the same reason as the version probe: a binary that is
+     * not ffmpeg may print forever. */
+    for (int line_number = 0; line_number < 256; ++line_number) {
+        if (fgets(line, sizeof(line), pipe_handle) == NULL) {
+            break;
+        }
+        if (strstr(line, "strftime_mkdir") != NULL) {
+            supported = true;
+            break;
+        }
+    }
+    (void)pclose(pipe_handle);
+    return supported;
+}
 
 bool krtsp_ffmpeg_needs_legacy_timeout(const char *ffmpeg_path)
 {
@@ -168,6 +233,18 @@ bool krtsp_ffmpeg_needs_legacy_timeout(const char *ffmpeg_path)
     return legacy;
 }
 
+/* Newest segment activity, from the manifest ffmpeg rewrites as each
+ * segment completes.  One stat, whatever shape the recording tree is. */
+static long long segment_mtime_ms(const char *path)
+{
+    struct stat info;
+
+    if (path == NULL || path[0] == '\0' || stat(path, &info) != 0) {
+        return 0;
+    }
+    return (long long)info.st_mtime * 1000;
+}
+
 /* ------------------------------- spawning ------------------------------- */
 
 /* Read exactly `size` bytes unless the stream ends.
@@ -214,6 +291,19 @@ static pid_t spawn_child(krtsp_source *source, int *read_fd)
     request.low_latency = source->options.low_latency;
     request.letterbox = source->options.letterbox;
     request.legacy_timeout_flag = source->legacy_timeout;
+    request.roles = source->roles;
+    request.record_dir = source->options.record_dir;
+    request.record_pattern = source->options.record_pattern;
+    request.segment_seconds = source->options.segment_seconds;
+    request.record_audio = source->options.record_audio;
+    request.segment_mkdir = source->segment_mkdir;
+    request.segment_list = source->segment_list[0] != '\0'
+                               ? source->segment_list
+                               : NULL;
+    /* Each spawn starts its own grace period: a restarted segmenter has
+     * legitimately written nothing yet, and carrying the previous run's
+     * observation forward would restart-loop it. */
+    atomic_store(&source->segment_seen_ms, 0);
 
     if (krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
                          sizeof(storage)) == 0u) {
@@ -446,7 +536,50 @@ static void *supervisor_main(void *argument)
                 break;
             }
             now = monotonic_ms();
-            if (now - started > source->options.grace_ms &&
+
+            /*
+             * Recording liveness is its own question.  A camera can
+             * deliver frames while its segmenter is stuck on a full disk
+             * or an unwritable directory, and can keep writing segments
+             * after the decode pipe has stopped.  One timer cannot report
+             * both, so each sink gets its own.
+             */
+            if ((source->roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
+                long long mtime = segment_mtime_ms(source->segment_list);
+                int segment_stall = source->options.segment_stall_ms;
+                long long seen;
+
+                if (segment_stall <= 0) {
+                    int seconds = source->options.segment_seconds > 0
+                                      ? source->options.segment_seconds
+                                      : 10;
+                    /* Three rotations: tolerant of one missed segment,
+                     * intolerant of a dead sink. */
+                    segment_stall = seconds * 3000;
+                }
+                if (mtime > source->segment_mtime) {
+                    source->segment_mtime = mtime;
+                    atomic_store(&source->segment_seen_ms, now);
+                    atomic_store(&source->record_status, (int)KRTSP_ONLINE);
+                }
+                seen = atomic_load(&source->segment_seen_ms);
+                if (seen == 0) {
+                    /* Nothing yet this run: the grace period runs from
+                     * the spawn, since a fresh segmenter has legitimately
+                     * written nothing. */
+                    seen = started;
+                }
+                if (now - started > source->options.grace_ms &&
+                    now - seen > segment_stall) {
+                    atomic_store(&source->record_status, (int)KRTSP_STALE);
+                    atomic_fetch_add(&source->stalls, 1ull);
+                    stalled = true;
+                    break;
+                }
+            }
+
+            if ((source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u &&
+                now - started > source->options.grace_ms &&
                 now - atomic_load(&source->last_frame_ms) >
                     source->options.stall_ms) {
                 /* Alive but silent: the wedged-camera case.  Nothing
@@ -458,9 +591,27 @@ static void *supervisor_main(void *argument)
             }
         }
 
-        /* Teardown order matters: closing the pipe and killing the child
-         * is what unblocks a reader sitting in read().  Joining first
-         * would deadlock on exactly the wedged camera this exists for. */
+        /*
+         * Teardown order matters, and there are two orderings that look
+         * plausible and only one that is correct.
+         *
+         * Joining the reader first deadlocks on exactly the wedged camera
+         * this supervisor exists for: the reader is parked in read() on a
+         * pipe nothing is writing to, and will be until something ends
+         * the child.
+         *
+         * So kill the child first.  terminate_child() does not return
+         * until the process is reaped, and a reaped child's end of the
+         * pipe is closed, so the reader's read() returns 0 and the thread
+         * leaves on its own.  Only then is closing the descriptor safe.
+         *
+         * Closing before the join - which is what this did originally -
+         * yanks the descriptor out from under a thread that may be inside
+         * read() on it.  ThreadSanitizer flags it, and the practical
+         * hazard is worse than the report: once closed, that number is
+         * free for any other thread's open() to claim, and the reader
+         * would then read a frame's worth of some unrelated file.
+         */
         pthread_mutex_lock(&source->lock);
         int fd_to_close = source->pipe_read;
         source->pipe_read = -1;
@@ -471,12 +622,12 @@ static void *supervisor_main(void *argument)
         if (to_kill > 0) {
             terminate_child(to_kill);
         }
-        if (fd_to_close >= 0) {
-            (void)close(fd_to_close);
-        }
         if (source->reader_started) {
             (void)pthread_join(source->reader, NULL);
             source->reader_started = false;
+        }
+        if (fd_to_close >= 0) {
+            (void)close(fd_to_close);
         }
         if (pid > 0) {
             (void)waitpid(pid, NULL, WNOHANG);
@@ -536,8 +687,29 @@ bool krtsp_source_start(
         krtsp_source_options_init(&defaults);
         options = &defaults;
     }
-    if (options->width <= 0 || options->height <= 0) {
-        return false;
+    {
+        unsigned roles = options->roles != 0u
+                             ? options->roles
+                             : (unsigned)KRTSP_ROLE_DECODE;
+
+        if ((roles & ~(unsigned)(KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD)) !=
+            0u) {
+            return false;
+        }
+        /* Frame geometry is only meaningful to the decode sink; a
+         * record-only source has no decoded frames to size. */
+        if ((roles & (unsigned)KRTSP_ROLE_DECODE) != 0u &&
+            (options->width <= 0 || options->height <= 0)) {
+            return false;
+        }
+        if ((roles & (unsigned)KRTSP_ROLE_RECORD) != 0u &&
+            (options->record_dir == NULL ||
+             options->record_dir[0] == '\0')) {
+            return false;
+        }
+        if (options->segment_seconds < 0 || options->segment_stall_ms < 0) {
+            return false;
+        }
     }
     if (options->stall_ms <= 0 || options->grace_ms < 0 ||
         options->backoff_min_ms <= 0 ||
@@ -571,11 +743,32 @@ bool krtsp_source_start(
     (void)snprintf(source->ffmpeg, sizeof(source->ffmpeg), "%s", binary);
     source->legacy_timeout = krtsp_ffmpeg_needs_legacy_timeout(source->ffmpeg);
 
-    if (!krtsp_frame_init(&source->frame, options->width, options->height)) {
-        free(source);
-        return false;
+    source->roles = options->roles != 0u ? options->roles
+                                        : (unsigned)KRTSP_ROLE_DECODE;
+    if ((source->roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
+        /* Probed, not assumed: ffmpeg 5.1 has -strftime but not
+         * -strftime_mkdir, and passing a flag the binary lacks fails the
+         * spawn outright. */
+        source->segment_mkdir =
+            krtsp_ffmpeg_supports_segment_mkdir(source->ffmpeg);
+        if (snprintf(source->segment_list, sizeof(source->segment_list),
+                     "%s/.segments", options->record_dir) < 0) {
+            free(source);
+            return false;
+        }
+        atomic_store(&source->record_status, (int)KRTSP_STARTING);
+    } else {
+        atomic_store(&source->record_status, (int)KRTSP_OFFLINE);
     }
-    source->frame_size = krtsp_frame_size(source->frame);
+
+    if ((source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u) {
+        if (!krtsp_frame_init(&source->frame, options->width,
+                              options->height)) {
+            free(source);
+            return false;
+        }
+        source->frame_size = krtsp_frame_size(source->frame);
+    }
 
     if (pthread_mutex_init(&source->lock, NULL) != 0) {
         krtsp_frame_free(source->frame);
@@ -645,12 +838,62 @@ void krtsp_source_release(krtsp_source *source)
     krtsp_frame_release(source->frame);
 }
 
-krtsp_status krtsp_source_status(const krtsp_source *source)
+krtsp_status krtsp_source_role_status(
+    const krtsp_source *source, krtsp_role role)
 {
     if (source == NULL) {
         return KRTSP_FAILED;
     }
-    return (krtsp_status)atomic_load(&((krtsp_source *)source)->status);
+    if ((source->roles & (unsigned)role) == 0u) {
+        /* Not running this role.  Reporting it offline is honest;
+         * reporting it online would let a caller believe an archive
+         * exists that nothing is writing. */
+        return KRTSP_OFFLINE;
+    }
+    if (role == KRTSP_ROLE_RECORD) {
+        return (krtsp_status)atomic_load(&source->record_status);
+    }
+    return (krtsp_status)atomic_load(&source->status);
+}
+
+/* Worse-of ordering.  A source with a healthy pipe and a wedged segmenter
+ * is not "online", and saying so is the whole reason health is tracked
+ * per role. */
+static int status_severity(krtsp_status status)
+{
+    switch (status) {
+    case KRTSP_ONLINE:   return 0;
+    case KRTSP_STARTING: return 1;
+    case KRTSP_STALE:    return 2;
+    case KRTSP_OFFLINE:  return 3;
+    case KRTSP_FAILED:   return 4;
+    default:             return 5;
+    }
+}
+
+krtsp_status krtsp_source_status(const krtsp_source *source)
+{
+    krtsp_status worst = KRTSP_ONLINE;
+    bool any = false;
+
+    if (source == NULL) {
+        return KRTSP_FAILED;
+    }
+    if ((source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u) {
+        worst = (krtsp_status)atomic_load(
+            &((krtsp_source *)source)->status);
+        any = true;
+    }
+    if ((source->roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
+        krtsp_status record = (krtsp_status)atomic_load(
+            &((krtsp_source *)source)->record_status);
+
+        if (!any || status_severity(record) > status_severity(worst)) {
+            worst = record;
+        }
+        any = true;
+    }
+    return any ? worst : KRTSP_FAILED;
 }
 
 void krtsp_source_get_stats(

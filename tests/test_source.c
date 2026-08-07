@@ -7,9 +7,11 @@
 
 #include "kilix_rtsp.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -369,6 +371,181 @@ test_rejections(void)
     return true;
 }
 
+/* Per-run recording directory, so a crashed earlier run cannot make this
+ * one fail. */
+static bool make_record_dir(char *out, size_t capacity, const char *tag)
+{
+    if (snprintf(out, capacity, "build/rec-%ld-%s", (long)getpid(), tag) < 0) {
+        return false;
+    }
+    (void)mkdir(out, 0700);
+    return true;
+}
+
+static void remove_tree(const char *path)
+{
+    DIR *directory = opendir(path);
+    struct dirent *entry;
+
+    if (directory == NULL) {
+        return;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        char child[512];
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (snprintf(child, sizeof(child), "%s/%s", path,
+                     entry->d_name) > 0) {
+            (void)remove(child);
+        }
+    }
+    (void)closedir(directory);
+    (void)rmdir(path);
+}
+
+/* A record-only source decodes nothing, so it needs no frame geometry -
+ * requiring it would force callers to invent numbers for buffers that are
+ * never allocated. */
+static bool
+test_record_only_source_needs_no_geometry(void)
+{
+    krtsp_source_options options;
+    krtsp_source *source = NULL;
+    char dir[256];
+
+    if (!make_record_dir(dir, sizeof(dir), "geom")) {
+        return false;
+    }
+    krtsp_source_options_init(&options);
+    options.roles = (unsigned)KRTSP_ROLE_RECORD;
+    options.record_dir = dir;
+    options.ffmpeg_path = fake_path();
+    options.width = 0;
+    options.height = 0;
+
+    CHECK(krtsp_source_start(&source, "rtsp://example/1", &options));
+    CHECK(source != NULL);
+    /* Nothing decodes, so nothing is ever borrowable. */
+    CHECK(krtsp_source_borrow(source, NULL) == NULL);
+    CHECK(krtsp_source_role_status(source, KRTSP_ROLE_DECODE) ==
+          KRTSP_OFFLINE);
+    krtsp_source_stop(source);
+    remove_tree(dir);
+
+    /* A decode role still requires geometry. */
+    krtsp_source_options_init(&options);
+    options.roles = (unsigned)KRTSP_ROLE_DECODE;
+    options.ffmpeg_path = fake_path();
+    CHECK(!krtsp_source_start(&source, "rtsp://example/1", &options));
+
+    /* And a record role still requires somewhere to write. */
+    krtsp_source_options_init(&options);
+    options.roles = (unsigned)KRTSP_ROLE_RECORD;
+    options.record_dir = NULL;
+    options.ffmpeg_path = fake_path();
+    CHECK(!krtsp_source_start(&source, "rtsp://example/1", &options));
+    return true;
+}
+
+/*
+ * The reason health is per role: a camera can deliver frames while its
+ * segmenter is wedged.  The fake writes a few segments and then stops,
+ * while still streaming, so only the recording timer can notice.
+ */
+static bool
+test_wedged_segmenter_is_detected_while_frames_flow(void)
+{
+    krtsp_source_options options;
+    krtsp_source *source = NULL;
+    char dir[256];
+    bool saw_record_stale = false;
+
+    if (!make_record_dir(dir, sizeof(dir), "wedge")) {
+        return false;
+    }
+    (void)setenv("FAKE_FFMPEG_SEGMENTS", "2", 1);
+    (void)setenv("FAKE_FFMPEG_SEGMENT_MS", "100", 1);
+
+    krtsp_source_options_init(&options);
+    options.roles = (unsigned)KRTSP_ROLE_DECODE | (unsigned)KRTSP_ROLE_RECORD;
+    options.record_dir = dir;
+    options.width = W;
+    options.height = H;
+    options.ffmpeg_path = fake_path();
+    options.grace_ms = 200;
+    options.stall_ms = 60000;       /* frames must not be what trips it */
+    options.segment_stall_ms = 400;
+    options.backoff_min_ms = 50;
+    options.backoff_max_ms = 100;
+
+    CHECK(krtsp_source_start(&source, "rtsp://example/1", &options));
+    for (int waited = 0; waited < 4000; waited += 50) {
+        if (krtsp_source_role_status(source, KRTSP_ROLE_RECORD) ==
+            KRTSP_STALE) {
+            saw_record_stale = true;
+            break;
+        }
+        sleep_ms(50);
+    }
+    CHECK(saw_record_stale);
+
+    krtsp_source_stop(source);
+    (void)unsetenv("FAKE_FFMPEG_SEGMENTS");
+    (void)unsetenv("FAKE_FFMPEG_SEGMENT_MS");
+    remove_tree(dir);
+    return true;
+}
+
+/* Overall health is the worse of the roles in use, so a wedged segmenter
+ * cannot be hidden by a healthy pipe. */
+static bool
+test_overall_status_takes_the_worse_role(void)
+{
+    krtsp_source_options options;
+    krtsp_source *source = NULL;
+    char dir[256];
+    bool degraded = false;
+
+    if (!make_record_dir(dir, sizeof(dir), "worse")) {
+        return false;
+    }
+    (void)setenv("FAKE_FFMPEG_SEGMENTS", "1", 1);
+    (void)setenv("FAKE_FFMPEG_SEGMENT_MS", "50", 1);
+
+    krtsp_source_options_init(&options);
+    options.roles = (unsigned)KRTSP_ROLE_DECODE | (unsigned)KRTSP_ROLE_RECORD;
+    options.record_dir = dir;
+    options.width = W;
+    options.height = H;
+    options.ffmpeg_path = fake_path();
+    options.grace_ms = 200;
+    options.stall_ms = 60000;
+    options.segment_stall_ms = 400;
+    options.backoff_min_ms = 50;
+    options.backoff_max_ms = 100;
+
+    CHECK(krtsp_source_start(&source, "rtsp://example/1", &options));
+    for (int waited = 0; waited < 4000; waited += 50) {
+        krtsp_status overall = krtsp_source_status(source);
+
+        if (overall != KRTSP_ONLINE && overall != KRTSP_STARTING) {
+            degraded = true;
+            break;
+        }
+        sleep_ms(50);
+    }
+    CHECK(degraded);
+
+    krtsp_source_stop(source);
+    (void)unsetenv("FAKE_FFMPEG_SEGMENTS");
+    (void)unsetenv("FAKE_FFMPEG_SEGMENT_MS");
+    remove_tree(dir);
+    return true;
+}
+
 typedef bool (*test_function)(void);
 
 typedef struct test_case {
@@ -391,7 +568,13 @@ main(void)
         {"stop while wedged", test_stop_while_wedged},
         {"missing binary is not a start failure",
          test_missing_binary_is_not_a_start_failure},
-        {"rejections", test_rejections}
+        {"rejections", test_rejections},
+        {"record only source needs no geometry",
+         test_record_only_source_needs_no_geometry},
+        {"wedged segmenter is detected while frames flow",
+         test_wedged_segmenter_is_detected_while_frames_flow},
+        {"overall status takes the worse role",
+         test_overall_status_takes_the_worse_role}
     };
     size_t passed = 0u;
 
