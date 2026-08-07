@@ -30,6 +30,12 @@
  *   FAKE_FFMPEG_STARTUP_MS        delay before the first frame (default 0),
  *                                 for exercising the startup grace period
  *   FAKE_FFMPEG_LOG               append a line per run, to prove restarts
+ *   FAKE_FFMPEG_SEGMENTS          when set, touch the -segment_list path
+ *                                 this many times at _SEGMENT_MS spacing
+ *                                 and then stop, standing in for a
+ *                                 segmenter that wedges while the camera
+ *                                 keeps delivering.  -1 keeps rotating.
+ *   FAKE_FFMPEG_SEGMENT_MS        spacing between those touches
  *
  * Each frame is filled with a single byte that increments per frame, so a
  * reader can detect both torn frames and lost ones.
@@ -42,6 +48,16 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+static long long now_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (long long)now.tv_sec * 1000 + (long long)now.tv_nsec / 1000000;
+}
 
 static int env_int(const char *name, int fallback)
 {
@@ -104,6 +120,11 @@ int main(int argc, char **argv)
     size_t frame_size;
     unsigned char *frame;
     int emitted = 0;
+    const char *segment_list = NULL;
+    int segments = 0;
+    int segment_ms = 200;
+    int written = 0;
+    long long last_segment = 0;
 
     /* Answer -version like the real binary.  krtsp_source probes for the
      * libavformat major to choose between -timeout and -stimeout, and a
@@ -111,6 +132,21 @@ int main(int argc, char **argv)
      * it blocked forever.  FAKE_FFMPEG_LIBAVFORMAT selects the reported
      * major so both spellings are reachable. */
     for (int index = 1; index < argc; ++index) {
+        /* Capability probes must answer and exit, for the same reason
+         * -version does: krtsp_source asks the binary what it supports
+         * before spawning it, and a stand-in that streamed frames at the
+         * question would block the probe forever.  FAKE_FFMPEG_MKDIR
+         * selects whether the segment muxer claims -strftime_mkdir, so
+         * both branches of that probe are reachable. */
+        if (strcmp(argv[index], "-h") == 0 && index + 1 < argc &&
+            strncmp(argv[index + 1], "muxer=", 6u) == 0) {
+            (void)printf("Segment muxer AVOptions:\n");
+            (void)printf("  -strftime          <boolean>    E..........\n");
+            if (env_int("FAKE_FFMPEG_MKDIR", 0) != 0) {
+                (void)printf("  -strftime_mkdir    <boolean>    E..........\n");
+            }
+            return 0;
+        }
         if (strcmp(argv[index], "-version") == 0) {
             (void)printf("ffmpeg version 6.0-fake\n");
             (void)printf("libavformat    %d. 16.100 / %d. 16.100\n",
@@ -137,6 +173,25 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Recording stand-in: rewrite the manifest the supervisor stats,
+     * then stop, so a wedged segmenter is reproducible on demand the way
+     * a wedged camera already is. */
+    {
+        const char *list = NULL;
+
+        for (int index = 1; index + 1 < argc; ++index) {
+            if (strcmp(argv[index], "-segment_list") == 0) {
+                list = argv[index + 1];
+                break;
+            }
+        }
+        if (list != NULL) {
+            segment_list = list;
+            segments = env_int("FAKE_FFMPEG_SEGMENTS", 0);
+            segment_ms = env_int("FAKE_FFMPEG_SEGMENT_MS", 200);
+        }
+    }
+
     if (width <= 0 || height <= 0) {
         return 2;
     }
@@ -149,6 +204,20 @@ int main(int argc, char **argv)
     sleep_ms(startup_ms);
 
     while (frames < 0 || emitted < frames) {
+        if (segment_list != NULL && (segments < 0 || written < segments)) {
+            long long now = now_ms();
+
+            if (now - last_segment >= segment_ms) {
+                FILE *manifest = fopen(segment_list, "w");
+
+                if (manifest != NULL) {
+                    (void)fprintf(manifest, "segment-%d.mkv\n", written);
+                    (void)fclose(manifest);
+                }
+                last_segment = now;
+                written++;
+            }
+        }
         memset(frame, (unsigned char)((emitted % 254) + 1), frame_size);
         if (!write_all(frame, frame_size)) {
             free(frame);

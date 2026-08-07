@@ -64,6 +64,82 @@ Cost follows output pixels rather than camera count, which is not the intuitive
 result: on one machine a seven-camera grid measured cheaper per camera than a
 single full-window view, because each tile decodes to a small frame.
 
+## Sharing one decode
+
+Decoding is the most expensive thing this library does — a full-screen
+source runs 21–44% of a core — so a second consumer that decodes its own copy
+doubles the largest cost in the system to produce bytes that already exist. Two
+viewers on one camera used to do exactly that.
+
+A source can instead publish frames into a named POSIX shared-memory ring that
+other processes attach to:
+
+```c
+krtsp_frame *ring;
+krtsp_frame_init_shared(&ring, "poolcam", 640, 360, /* max_readers */ 4);
+
+/* elsewhere, in another process */
+krtsp_frame *reader;
+krtsp_frame_attach(&reader, "poolcam");
+```
+
+Readers get the same borrow/release contract as an in-process consumer. The ring
+holds `max_readers + 2` slots — one the producer is filling, one holding the
+newest frame, and one per reader currently holding a borrow — and a borrow that
+would leave the producer nowhere to write is refused rather than overwriting a
+slot somebody is reading. `max_readers` counts *simultaneous borrows*, not
+attached processes; readers that borrow and release promptly share far fewer
+slots than their number.
+
+Frames are not authenticated. Anything able to open the object can read the
+camera's pixels, so it is created `0600`.
+
+## Recording
+
+The same ffmpeg process can also write the camera's own bitstream to disk, so
+one RTSP session serves both a viewer and an archive — which matters because
+some cameras refuse a second concurrent session:
+
+```c
+options.roles = KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD;
+options.record_dir = "/srv/video/poolcam";
+```
+
+`roles` is a bitmask because all three combinations are real. `KRTSP_ROLE_RECORD`
+alone never decodes at all: the segmenter copies packets straight to disk, so the
+camera costs I/O and nothing else.
+
+Recording never re-encodes — at the same resolution, re-encoding reliably
+produces *larger* files than the camera's own stream while burning a core.
+
+**Segments are Matroska by default.** mp4 cannot mux the `pcm_alaw` audio many
+cameras carry — `-c copy` fails outright — and MPEG-TS accepts it while silently
+dropping the audio stream. Matroska carries it untouched and tolerates a segment
+truncated by a power cut. The pattern's extension picks the container, so
+overriding it is a one-line change.
+
+Two things about segment timing are worth knowing before they surprise you:
+
+- **`segment_seconds` is a lower bound, honoured at the next keyframe.** With
+  `-c copy` there is nowhere else to cut, so a camera with a 4-second GOP turns a
+  10-second request into ~12-second files.
+- **The pattern must resolve to a unique name per segment.** The default has
+  second resolution, which is ample at 10-second segments in real time — but a
+  process catching up faster than real time can produce two segments within one
+  second and silently overwrite the first.
+
+A pattern containing `/` builds a date hierarchy, which needs the muxer to create
+directories. Not every ffmpeg can: **5.1 has `-strftime` but not
+`-strftime_mkdir`**, and the failure is silent until an hour rolls over and every
+segment starts failing. The default pattern is therefore flat, and
+`krtsp_ffmpeg_supports_segment_mkdir()` reports whether a hierarchical one is
+safe on the binary in use.
+
+Health is tracked per role. A camera can deliver frames while its segmenter is
+stuck on a full disk, or write segments after the decode pipe has stopped, so
+each sink has its own staleness timer and `krtsp_source_status()` reports the
+worse of the two.
+
 ## Configuration
 
 Configuration and data live **outside this repository**, under
