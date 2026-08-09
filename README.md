@@ -5,14 +5,16 @@ and presents them inside a terminal through the [Kitty graphics
 protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/). One camera fills
 the window; several compose into a mosaic.
 
-Acquisition is an `ffmpeg` subprocess per stream, supervised: the library reads
+Acquisition is a supervised `ffmpeg` subprocess per stream. The library reads
 fixed-size frames from a pipe, and a watchdog restarts a stream that dies *or*
-that stays connected while silently delivering nothing — which is how network
-cameras usually fail. Frames reach the terminal through
+stays connected while silently delivering nothing — which is how network
+cameras usually fail. The same process can copy the compressed stream into
+recording segments without opening a second camera session. Frames reach the
+terminal through
 [`kitty-framebuffer`](https://github.com/itsmygithubacct/kitty-framebuffer).
 
-The library is acquisition and presentation only. Recording, retention, and
-object detection are a separate product's concern.
+The library owns acquisition, presentation, and optional segmentation.
+Retention policy and object detection remain a consumer's concern.
 
 ## Checkout, build and test
 
@@ -26,7 +28,7 @@ make sanitize
 
 The submodules are required: the terminal-facing commands build against
 `kitty-terminal-session`, `soft-raster` and `kitty-pty-broker`. The library
-itself — acquisition — depends on none of them.
+itself — acquisition and recording — depends on none of them.
 
 Dependencies are a C11 compiler, POSIX, pthreads, and the **`ffmpeg` binary at
 runtime** — not the FFmpeg libraries at link time. `kilix-rtsp` never links
@@ -51,7 +53,9 @@ stderr, so the output pipes cleanly. `mosaic` with no argument shows every
 configured camera.
 
 Options: `--tier main|sub`, `--fps <n>`, `--config <path>`, and `--tab` to open
-a view in a new terminal tab. `q` or escape quits.
+a view in a new terminal tab. `--fps` applies to views and mosaics. Options are
+command-specific: an option a command would ignore is rejected, as are malformed
+numbers, extra targets, and mosaics larger than 16 cameras. `q` or escape quits.
 
 Every camera publishes more than one stream, and the right one depends on how
 large it will be drawn: a mosaic tile wants the substream, because scaling a
@@ -63,6 +67,12 @@ accordingly.
 Cost follows output pixels rather than camera count, which is not the intuitive
 result: on one machine a seven-camera grid measured cheaper per camera than a
 single full-window view, because each tile decodes to a small frame.
+
+A healthy full-window source is decoded directly as RGBA and handed to the
+presenter without a separate full-frame format conversion. A degraded/frozen
+frame is copied only when a status banner must be drawn. Mosaic sources decode
+to their tile sizes, and independent camera arrivals are coalesced into at most
+20 full-canvas composites per second rather than redrawing once per tile event.
 
 ## Sharing one decode
 
@@ -91,8 +101,17 @@ slot somebody is reading. `max_readers` counts *simultaneous borrows*, not
 attached processes; readers that borrow and release promptly share far fewer
 slots than their number.
 
+A producer holds a lifetime lock. Creating the same name while that producer is
+alive fails instead of unlinking a live feed; after a crash, a successor can
+identify and replace the orphan. Reader leases are tied to process IDs, so a
+reader killed while borrowing is reclaimed when the ring reaches capacity. The
+shared mutex is robust on Linux and repairs derived pin state if a process dies
+inside a critical section. Attach validates the exact object owner, mode, size,
+geometry, protocol version, and live-producer lock before mapping it.
+
 Frames are not authenticated. Anything able to open the object can read the
-camera's pixels, so it is created `0600`.
+camera's pixels, so it is forced to exact mode `0600` even under a stricter
+umask.
 
 ## Recording
 
@@ -140,6 +159,17 @@ stuck on a full disk, or write segments after the decode pipe has stopped, so
 each sink has its own staleness timer and `krtsp_source_status()` reports the
 worse of the two.
 
+Each restart begins a fresh health interval: an old manifest cannot make a new
+recording process look online, and a process only resets exponential backoff
+after every requested role has produced output for the configured stable
+period. Record-only sources allocate no raw-frame ring, pipe, or reader thread.
+
+Capability and metadata probes are direct `posix_spawnp()` calls, never shell
+commands. Their output is drained while the child runs, bounded in memory, and
+guarded by a monotonic hard deadline, so a silent or flooding binary cannot hang
+the caller. FFmpeg capabilities are cached once per binary path and concurrent
+requests for unrelated capabilities remain independent.
+
 ## Configuration
 
 Configuration and data live **outside this repository**, under
@@ -158,25 +188,40 @@ can be overridden with `KILIX_RTSP_FFMPEG` and `KILIX_RTSP_FFPROBE`, which
 matters on hosts carrying a vendor build with different codec support than the
 distribution's.
 
+The component-owned root and its leaf directories must be real directories,
+owned by the current user, at exact mode `0700`; symlinks and loose permissions
+are refused. On an older manually created installation, repair them before use:
+
+```sh
+chmod 700 ~/.local/gpu_terminal/kilix-rtsp \
+          ~/.local/gpu_terminal/kilix-rtsp/config
+```
+
 Start from `examples/cameras.conf.example`:
 
 ```sh
 mkdir -p ~/.local/gpu_terminal/kilix-rtsp/config
+chmod 700 ~/.local/gpu_terminal/kilix-rtsp \
+          ~/.local/gpu_terminal/kilix-rtsp/config
 cp examples/cameras.conf.example \
    ~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf
 chmod 600 ~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf
 ```
 
 **Camera configuration is a secret file.** RTSP URLs embed credentials as
-`rtsp://user:password@host/path`, so it is refused unless it is a regular file
-owned by you with no group or world permission bits, it never lives in the work
-tree, and errors never quote a URL. URLs are redacted wherever they are shown.
+`rtsp://user:password@host/path`, so it is refused unless it is a non-symlink
+regular file owned by you with no group or world permission bits. The opened
+descriptor itself is checked, closing path-replacement races. The file never
+lives in the work tree, parse input is bounded, duplicate/empty definitions are
+rejected, and errors never quote a URL. URLs are redacted wherever they are
+shown.
 
 Passwords containing `@` or `:` are handled automatically. Passwords containing
 `/`, `?` or `#` must be percent-encoded in the config file — each of those ends
 the URL's authority, so `rtsp://u:a/b@host/1` genuinely parses as host `u` with
 path `/b@host/1` under any conforming parser, and nothing downstream can recover
-what was meant.
+what was meant. Existing valid percent triplets are preserved rather than
+encoded a second time; malformed percent sequences are encoded literally.
 
 ## Detached views
 

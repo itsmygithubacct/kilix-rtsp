@@ -98,7 +98,7 @@ static void push_format(arg_writer *w, const char *format, ...)
 
 static void push_format(arg_writer *w, const char *format, ...)
 {
-    char scratch[256];
+    char scratch[KRTSP_ARGV_STORAGE_MAX];
     va_list arguments;
     int printed;
 
@@ -145,6 +145,11 @@ size_t krtsp_build_argv(
                                  : (unsigned)KRTSP_ROLE_DECODE;
     {
         if ((roles & ~(unsigned)(KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD)) != 0u) {
+            return 0u;
+        }
+        if ((roles & (unsigned)KRTSP_ROLE_DECODE) != 0u &&
+            request->pixfmt != KRTSP_PIXFMT_RGBA &&
+            request->pixfmt != KRTSP_PIXFMT_BGRA) {
             return 0u;
         }
         /* A recording sink with nowhere to write is a request that would
@@ -433,7 +438,25 @@ bool krtsp_url_escape_password(const char *url, char *out, size_t capacity)
     for (const char *scan = colon + 1; scan < at; ++scan) {
         unsigned char character = (unsigned char)*scan;
 
-        if (strchr(unreserved, character) != NULL && character != '\0') {
+        if (character == '%' && (size_t)(at - scan) >= 3u &&
+            ((scan[1] >= '0' && scan[1] <= '9') ||
+             (scan[1] >= 'a' && scan[1] <= 'f') ||
+             (scan[1] >= 'A' && scan[1] <= 'F')) &&
+            ((scan[2] >= '0' && scan[2] <= '9') ||
+             (scan[2] >= 'a' && scan[2] <= 'f') ||
+             (scan[2] >= 'A' && scan[2] <= 'F'))) {
+            /* The config format requires '/', '?' and '#' in a password to
+             * arrive percent-encoded because a URL parser cannot recover
+             * their raw form.  Preserve a valid triplet rather than encoding
+             * its '%' again and silently changing the password. */
+            if (used + 4u > capacity) {
+                out[0] = '\0';
+                return false;
+            }
+            out[used++] = *scan++;
+            out[used++] = *scan++;
+            out[used++] = *scan;
+        } else if (strchr(unreserved, character) != NULL && character != '\0') {
             if (used + 2u > capacity) {
                 out[0] = '\0';
                 return false;

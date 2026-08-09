@@ -122,6 +122,23 @@ static bool wait_for_restarts(krtsp_source *source, uint64_t want, int ms)
     return stats.restarts >= want;
 }
 
+static bool wait_for_stalls(krtsp_source *source, uint64_t want, int ms)
+{
+    krtsp_source_stats stats;
+    int waited = 0;
+
+    while (waited < ms) {
+        krtsp_source_get_stats(source, &stats);
+        if (stats.stalls >= want) {
+            return true;
+        }
+        sleep_ms(20);
+        waited += 20;
+    }
+    krtsp_source_get_stats(source, &stats);
+    return stats.stalls >= want;
+}
+
 /* ------------------------------- the tests ------------------------------ */
 
 static bool
@@ -139,6 +156,8 @@ test_frames_arrive(void)
                              &options));
     CHECK(wait_for_frames(source, 3u, 3000));
     CHECK(wait_for_status(source, KRTSP_ONLINE, 1000));
+    CHECK(krtsp_source_role_status(source, (krtsp_role)0x40) ==
+          KRTSP_FAILED);
 
     pixels = krtsp_source_borrow(source, &age);
     CHECK(pixels != NULL);
@@ -296,6 +315,31 @@ test_spawn_failure_backs_off_and_gives_up(void)
     return true;
 }
 
+/* Process uptime is not proof of a successful run.  A child that stays alive
+ * past stable_ms but never produces a frame must still count as a failure. */
+static bool
+test_stability_requires_output(void)
+{
+    krtsp_source *source = NULL;
+    krtsp_source_options options;
+
+    configure_fake("die", 0, 10);
+    (void)setenv("FAKE_FFMPEG_STARTUP_MS", "400", 1);
+    base_options(&options);
+    options.grace_ms = 5000;
+    options.stall_ms = 5000;
+    options.stable_ms = 100;
+    options.backoff_min_ms = 50;
+    options.backoff_max_ms = 100;
+    options.max_consecutive_failures = 2;
+
+    CHECK(krtsp_source_start(&source, "rtsp://example.invalid/1", &options));
+    CHECK(wait_for_status(source, KRTSP_FAILED, 5000));
+    krtsp_source_stop(source);
+    (void)unsetenv("FAKE_FFMPEG_STARTUP_MS");
+    return true;
+}
+
 static bool
 test_stop_while_wedged(void)
 {
@@ -360,6 +404,25 @@ test_rejections(void)
 
     options.stall_ms = 0;
     CHECK(!krtsp_source_start(&source, "rtsp://x/1", &options));
+    base_options(&options);
+
+    options.pixfmt = (krtsp_pixfmt)99;
+    CHECK(!krtsp_source_start(&source, "rtsp://x/1", &options));
+    base_options(&options);
+    options.fps_cap = -1;
+    CHECK(!krtsp_source_start(&source, "rtsp://x/1", &options));
+    base_options(&options);
+    options.grace_ms = -1;
+    CHECK(!krtsp_source_start(&source, "rtsp://x/1", &options));
+    base_options(&options);
+    options.stable_ms = -1;
+    CHECK(!krtsp_source_start(&source, "rtsp://x/1", &options));
+    base_options(&options);
+    options.max_consecutive_failures = -1;
+    CHECK(!krtsp_source_start(&source, "rtsp://x/1", &options));
+    base_options(&options);
+    options.roles = 0x80u;
+    CHECK(!krtsp_source_start(&source, "rtsp://x/1", &options));
 
     /* NULL is a safe no-op on every teardown path. */
     krtsp_source_stop(NULL);
@@ -375,11 +438,13 @@ test_rejections(void)
  * one fail. */
 static bool make_record_dir(char *out, size_t capacity, const char *tag)
 {
-    if (snprintf(out, capacity, "build/rec-%ld-%s", (long)getpid(), tag) < 0) {
+    int printed = snprintf(out, capacity, "/tmp/krtsp-rec-%ld-%s-XXXXXX",
+                           (long)getpid(), tag);
+
+    if (printed < 0 || (size_t)printed >= capacity) {
         return false;
     }
-    (void)mkdir(out, 0700);
-    return true;
+    return mkdtemp(out) != NULL;
 }
 
 static void remove_tree(const char *path)
@@ -404,6 +469,21 @@ static void remove_tree(const char *path)
     }
     (void)closedir(directory);
     (void)rmdir(path);
+}
+
+static bool file_contains(const char *path, const char *needle)
+{
+    char buffer[8192];
+    FILE *file = fopen(path, "r");
+    size_t used;
+
+    if (file == NULL) {
+        return false;
+    }
+    used = fread(buffer, 1u, sizeof(buffer) - 1u, file);
+    buffer[used] = '\0';
+    (void)fclose(file);
+    return strstr(buffer, needle) != NULL;
 }
 
 /* A record-only source decodes nothing, so it needs no frame geometry -
@@ -447,6 +527,111 @@ test_record_only_source_needs_no_geometry(void)
     options.record_dir = NULL;
     options.ffmpeg_path = fake_path();
     CHECK(!krtsp_source_start(&source, "rtsp://example/1", &options));
+    return true;
+}
+
+static bool
+test_source_owns_option_strings(void)
+{
+    krtsp_source_options options;
+    krtsp_source *source = NULL;
+    char directory[256];
+    char record_dir[256];
+    char record_pattern[64] = "original-%S.mkv";
+    char expected_output[512];
+    char log_path[512];
+    char argv_log[512];
+    char mutated_log[256];
+
+    if (!make_record_dir(directory, sizeof(directory), "owned")) {
+        return false;
+    }
+    CHECK(snprintf(record_dir, sizeof(record_dir), "%s", directory) > 0);
+    CHECK(snprintf(log_path, sizeof(log_path), "%s/ffmpeg.log", directory) > 0);
+    CHECK(snprintf(argv_log, sizeof(argv_log), "%s/argv.log", directory) > 0);
+    CHECK(snprintf(expected_output, sizeof(expected_output), "%s/%s",
+                   directory, record_pattern) > 0);
+    CHECK(snprintf(mutated_log, sizeof(mutated_log),
+                   "/tmp/krtsp-mutated-%ld.log", (long)getpid()) > 0);
+    (void)unlink(mutated_log);
+
+    configure_fake("die", 0, 10);
+    (void)setenv("FAKE_FFMPEG_ARGV_LOG", argv_log, 1);
+    krtsp_source_options_init(&options);
+    options.roles = (unsigned)KRTSP_ROLE_RECORD;
+    options.record_dir = record_dir;
+    options.record_pattern = record_pattern;
+    options.log_path = log_path;
+    options.ffmpeg_path = fake_path();
+    options.backoff_min_ms = 50;
+    options.backoff_max_ms = 100;
+
+    CHECK(krtsp_source_start(&source, "rtsp://example/1", &options));
+    /* These arrays belong to the caller and may change as soon as start()
+     * returns.  Restarts must keep using the source's owned copies. */
+    (void)snprintf(record_dir, sizeof(record_dir), "/tmp/not-the-record-dir");
+    (void)snprintf(record_pattern, sizeof(record_pattern), "mutated.mkv");
+    (void)snprintf(log_path, sizeof(log_path), "%s", mutated_log);
+    CHECK(wait_for_restarts(source, 2u, 5000));
+    krtsp_source_stop(source);
+
+    CHECK(file_contains(argv_log, expected_output));
+    CHECK(!file_contains(argv_log, "mutated.mkv"));
+    CHECK(access(mutated_log, F_OK) != 0);
+    (void)unsetenv("FAKE_FFMPEG_ARGV_LOG");
+    remove_tree(directory);
+    return true;
+}
+
+/* A manifest left by a previous run cannot make a fresh recorder healthy.
+ * This run must rewrite it before status may become ONLINE. */
+static bool
+test_stale_manifest_does_not_mark_new_run_online(void)
+{
+    krtsp_source_options options;
+    krtsp_source *source = NULL;
+    char dir[256];
+    char manifest[512];
+    bool saw_online = false;
+    FILE *file;
+
+    if (!make_record_dir(dir, sizeof(dir), "old-manifest")) {
+        return false;
+    }
+    CHECK(snprintf(manifest, sizeof(manifest), "%s/.segments", dir) > 0);
+    file = fopen(manifest, "w");
+    CHECK(file != NULL);
+    CHECK(fputs("old-segment.mkv\n", file) >= 0);
+    CHECK(fclose(file) == 0);
+
+    configure_fake("normal", -1, 10);
+    (void)setenv("FAKE_FFMPEG_SEGMENTS", "0", 1);
+    krtsp_source_options_init(&options);
+    options.roles = (unsigned)KRTSP_ROLE_RECORD;
+    options.record_dir = dir;
+    options.ffmpeg_path = fake_path();
+    options.grace_ms = 100;
+    options.segment_stall_ms = 300;
+    options.backoff_min_ms = 50;
+    options.backoff_max_ms = 100;
+
+    CHECK(krtsp_source_start(&source, "rtsp://example/1", &options));
+    for (int waited = 0; waited < 3000; waited += 20) {
+        if (krtsp_source_role_status(source, KRTSP_ROLE_RECORD) ==
+            KRTSP_ONLINE) {
+            saw_online = true;
+        }
+        if (wait_for_stalls(source, 1u, 20)) {
+            break;
+        }
+        sleep_ms(20);
+    }
+    CHECK(!saw_online);
+    CHECK(wait_for_stalls(source, 1u, 1000));
+
+    krtsp_source_stop(source);
+    (void)unsetenv("FAKE_FFMPEG_SEGMENTS");
+    remove_tree(dir);
     return true;
 }
 
@@ -565,12 +750,16 @@ main(void)
         {"partial frame resumes", test_partial_frame_resumes},
         {"spawn failure backs off and gives up",
          test_spawn_failure_backs_off_and_gives_up},
+        {"stability requires output", test_stability_requires_output},
         {"stop while wedged", test_stop_while_wedged},
         {"missing binary is not a start failure",
          test_missing_binary_is_not_a_start_failure},
         {"rejections", test_rejections},
         {"record only source needs no geometry",
          test_record_only_source_needs_no_geometry},
+        {"source owns option strings", test_source_owns_option_strings},
+        {"stale manifest does not mark new run online",
+         test_stale_manifest_does_not_mark_new_run_online},
         {"wedged segmenter is detected while frames flow",
          test_wedged_segmenter_is_detected_while_frames_flow},
         {"overall status takes the worse role",

@@ -1,13 +1,13 @@
 /*
  * One camera as a supervised ffmpeg subprocess.
  *
- * Two threads per source:
+ * Decode sources use two threads; record-only sources need just the first:
  *
  *   reader      blocks in read() on the child's stdout, assembles whole
  *               frames, publishes them.  Exits on EOF or error.
  *   supervisor  owns the child's lifecycle.  Spawns it, watches on a
  *               one-second tick, kills and restarts it, and applies the
- *               backoff.  This is the only thread that calls fork/exec,
+ *               backoff.  This is the only thread that calls posix_spawn,
  *               waitpid or kill.
  *
  * A blocked reader is not a problem to be avoided; it is the normal state,
@@ -24,14 +24,24 @@
  *                          without sending anything
  *
  * Only the second needs a timer, and it is the one that actually happens.
+ * posix_spawn() also avoids the unsafe post-fork work that a multithreaded
+ * terminal would otherwise perform before exec.
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "kilix_rtsp.h"
+#include "krtsp_exec.h"
+#include "krtsp_source_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,11 +52,16 @@
 #include <time.h>
 #include <unistd.h>
 
+extern char **environ;
+
 struct krtsp_source {
     char url[512];
     krtsp_source_options options;
     char ffmpeg[256];
     bool legacy_timeout;
+    char *owned_log_path;
+    char *owned_record_dir;
+    char *owned_record_pattern;
 
     krtsp_frame *frame;
     size_t frame_size;
@@ -57,7 +72,7 @@ struct krtsp_source {
     /* The manifest's own mtime is wall-clock; when we last saw it change
      * is monotonic.  Only the second can be compared against the tick,
      * and mixing them is how a clock adjustment becomes a restart loop. */
-    long long segment_mtime;          /* supervisor thread only */
+    long long segment_mtime_ns;       /* supervisor thread only */
     _Atomic long long segment_seen_ms;
     _Atomic int record_status;
 
@@ -76,6 +91,8 @@ struct krtsp_source {
 
     _Atomic int status;
     _Atomic long long last_frame_ms;
+    _Atomic long long decode_online_since_ms;
+    _Atomic long long record_online_since_ms;
 
     _Atomic unsigned long long frames;
     _Atomic unsigned long long restarts;
@@ -134,6 +151,146 @@ const char *krtsp_status_name(krtsp_status status)
 
 /* ---------------------------- ffmpeg probing ---------------------------- */
 
+#define PROBE_CACHE_MAX 8
+#define PROBE_LEGACY_TIMEOUT 1u
+#define PROBE_SEGMENT_MKDIR 2u
+#define PROBE_PATH_MAX 256
+
+typedef struct probe_cache_entry {
+    char path[PROBE_PATH_MAX];
+    unsigned known;
+    unsigned value;
+    unsigned running;
+} probe_cache_entry;
+
+static pthread_mutex_t probe_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t probe_cache_ready = PTHREAD_COND_INITIALIZER;
+static probe_cache_entry probe_cache[PROBE_CACHE_MAX];
+
+static bool probe_segment_mkdir(const char *ffmpeg_path)
+{
+    char output[32768];
+    char *argv[] = {
+        (char *)ffmpeg_path, (char *)"-hide_banner", (char *)"-h",
+        (char *)"muxer=segment", NULL
+    };
+
+    return krtsp_exec_capture(ffmpeg_path, argv, output, sizeof(output), 5000) ==
+               0 &&
+           strstr(output, "strftime_mkdir") != NULL;
+}
+
+static bool probe_legacy_timeout(const char *ffmpeg_path)
+{
+    char output[8192];
+    char *argv[] = {
+        (char *)ffmpeg_path, (char *)"-hide_banner", (char *)"-version", NULL
+    };
+    const char *line;
+    int major = 0;
+
+    if (krtsp_exec_capture(ffmpeg_path, argv, output, sizeof(output), 5000) !=
+        0) {
+        return false;
+    }
+    line = output;
+    while (line[0] != '\0') {
+        const char *next = strchr(line, '\n');
+        size_t length = next != NULL ? (size_t)(next - line) : strlen(line);
+
+        if (length >= 11u && strncmp(line, "libavformat", 11u) == 0) {
+            const char *scan = line + 11;
+            char *end;
+            long parsed;
+
+            while ((size_t)(scan - line) < length &&
+                   (*scan < '0' || *scan > '9')) {
+                scan++;
+            }
+            if ((size_t)(scan - line) >= length) {
+                break;
+            }
+            errno = 0;
+            parsed = strtol(scan, &end, 10);
+            if (errno == 0 && end != scan &&
+                (size_t)(end - line) <= length && parsed > 0 &&
+                parsed <= INT_MAX) {
+                major = (int)parsed;
+            }
+            break;
+        }
+        if (next == NULL) {
+            break;
+        }
+        line = next + 1;
+    }
+    return major > 0 && major < 59;
+}
+
+static bool cached_probe(const char *path, unsigned capability,
+                         bool (*probe)(const char *))
+{
+    probe_cache_entry *entry = NULL;
+    bool value;
+
+    if (strlen(path) >= PROBE_PATH_MAX) {
+        return probe(path);
+    }
+    (void)pthread_mutex_lock(&probe_cache_lock);
+    for (;;) {
+        probe_cache_entry *empty = NULL;
+
+        entry = NULL;
+        for (size_t index = 0u; index < PROBE_CACHE_MAX; ++index) {
+            probe_cache_entry *candidate = &probe_cache[index];
+
+            if (candidate->path[0] == '\0') {
+                if (empty == NULL) {
+                    empty = candidate;
+                }
+            } else if (strcmp(candidate->path, path) == 0) {
+                entry = candidate;
+                break;
+            }
+        }
+        if (entry == NULL) {
+            if (empty == NULL) {
+                (void)pthread_mutex_unlock(&probe_cache_lock);
+                return probe(path);
+            }
+            entry = empty;
+            (void)snprintf(entry->path, sizeof(entry->path), "%s", path);
+        }
+        if ((entry->known & capability) != 0u) {
+            value = (entry->value & capability) != 0u;
+            (void)pthread_mutex_unlock(&probe_cache_lock);
+            return value;
+        }
+        if ((entry->running & capability) == 0u) {
+            entry->running |= capability;
+            break;
+        }
+        /* Another source is already asking this exact question.  Wait for
+         * its result; unrelated paths and capabilities probe concurrently. */
+        (void)pthread_cond_wait(&probe_cache_ready, &probe_cache_lock);
+    }
+
+    (void)pthread_mutex_unlock(&probe_cache_lock);
+    value = probe(path);
+
+    (void)pthread_mutex_lock(&probe_cache_lock);
+    entry->known |= capability;
+    entry->running &= ~capability;
+    if (value) {
+        entry->value |= capability;
+    } else {
+        entry->value &= ~capability;
+    }
+    (void)pthread_cond_broadcast(&probe_cache_ready);
+    (void)pthread_mutex_unlock(&probe_cache_lock);
+    return value;
+}
+
 /*
  * Does this ffmpeg's segment muxer create the directories a strftime
  * pattern names?
@@ -151,98 +308,33 @@ const char *krtsp_status_name(krtsp_status status)
  */
 bool krtsp_ffmpeg_supports_segment_mkdir(const char *ffmpeg_path)
 {
-    char command[512];
-    char line[256];
-    FILE *pipe_handle;
-    bool supported = false;
-
     if (ffmpeg_path == NULL || ffmpeg_path[0] == '\0') {
         ffmpeg_path = "ffmpeg";
     }
-    if (snprintf(command, sizeof(command),
-                 "%s -hide_banner -h muxer=segment 2>/dev/null",
-                 ffmpeg_path) < 0) {
-        return false;
-    }
-    pipe_handle = popen(command, "r");
-    if (pipe_handle == NULL) {
-        return false;
-    }
-    /* Bounded for the same reason as the version probe: a binary that is
-     * not ffmpeg may print forever. */
-    for (int line_number = 0; line_number < 256; ++line_number) {
-        if (fgets(line, sizeof(line), pipe_handle) == NULL) {
-            break;
-        }
-        if (strstr(line, "strftime_mkdir") != NULL) {
-            supported = true;
-            break;
-        }
-    }
-    (void)pclose(pipe_handle);
-    return supported;
+    return cached_probe(ffmpeg_path, PROBE_SEGMENT_MKDIR,
+                        probe_segment_mkdir);
 }
 
 bool krtsp_ffmpeg_needs_legacy_timeout(const char *ffmpeg_path)
 {
-    char command[512];
-    char line[256];
-    FILE *pipe_handle;
-    bool legacy = false;
-    int major = 0;
-
     if (ffmpeg_path == NULL || ffmpeg_path[0] == '\0') {
         ffmpeg_path = "ffmpeg";
     }
-    /* Only the version banner is needed, and the binary name comes from
-     * configuration rather than from a stream, so this is not a shell
-     * injection surface in the way a URL would be. */
-    if (snprintf(command, sizeof(command),
-                 "%s -hide_banner -version 2>/dev/null", ffmpeg_path) < 0) {
-        return false;
-    }
-    pipe_handle = popen(command, "r");
-    if (pipe_handle == NULL) {
-        return false;
-    }
-    /* Bounded: a binary that is not ffmpeg may produce output forever,
-     * and a probe that can hang is worse than a probe that guesses. */
-    for (int line_number = 0; line_number < 64; ++line_number) {
-        if (fgets(line, sizeof(line), pipe_handle) == NULL) {
-            break;
-        }
-        if (strncmp(line, "libavformat", 11u) == 0) {
-            const char *scan = line + 11;
-
-            while (*scan != '\0' && (*scan < '0' || *scan > '9')) {
-                scan++;
-            }
-            major = atoi(scan);
-            break;
-        }
-    }
-    (void)pclose(pipe_handle);
-
-    /* ffmpeg renamed the RTSP socket timeout at libavformat 59.  A
-     * version we could not read is left on the modern spelling: guessing
-     * the old one on a new binary is an immediate hard error, while the
-     * reverse only matters on hosts old enough to be rare. */
-    if (major > 0 && major < 59) {
-        legacy = true;
-    }
-    return legacy;
+    return cached_probe(ffmpeg_path, PROBE_LEGACY_TIMEOUT,
+                        probe_legacy_timeout);
 }
 
 /* Newest segment activity, from the manifest ffmpeg rewrites as each
  * segment completes.  One stat, whatever shape the recording tree is. */
-static long long segment_mtime_ms(const char *path)
+static long long segment_mtime_ns(const char *path)
 {
     struct stat info;
 
     if (path == NULL || path[0] == '\0' || stat(path, &info) != 0) {
         return 0;
     }
-    return (long long)info.st_mtime * 1000;
+    return (long long)info.st_mtim.tv_sec * 1000000000LL +
+           (long long)info.st_mtim.tv_nsec;
 }
 
 /* ------------------------------- spawning ------------------------------- */
@@ -259,7 +351,13 @@ static bool read_full(int fd, uint8_t *buffer, size_t size)
     size_t total = 0u;
 
     while (total < size) {
-        ssize_t count = read(fd, buffer + total, size - total);
+        size_t remaining = size - total;
+        ssize_t count;
+
+        if (remaining > (size_t)SSIZE_MAX) {
+            remaining = (size_t)SSIZE_MAX;
+        }
+        count = read(fd, buffer + total, remaining);
 
         if (count > 0) {
             total += (size_t)count;
@@ -274,36 +372,101 @@ static bool read_full(int fd, uint8_t *buffer, size_t size)
     return true;
 }
 
+static void fill_args_request(const krtsp_source *source,
+                              krtsp_args_request *request)
+{
+    krtsp_args_request_init(request);
+    request->url = source->url;
+    request->width = source->options.width;
+    request->height = source->options.height;
+    request->fps_cap = source->options.fps_cap;
+    request->pixfmt = source->options.pixfmt;
+    request->low_latency = source->options.low_latency;
+    request->letterbox = source->options.letterbox;
+    request->legacy_timeout_flag = source->legacy_timeout;
+    request->roles = source->roles;
+    request->record_dir = source->options.record_dir;
+    request->record_pattern = source->options.record_pattern;
+    request->segment_seconds = source->options.segment_seconds;
+    request->record_audio = source->options.record_audio;
+    request->segment_mkdir = source->segment_mkdir;
+    request->segment_list = source->segment_list[0] != '\0'
+                                ? source->segment_list
+                                : NULL;
+}
+
+static bool move_above_stdio(int *fd)
+{
+    int moved;
+
+    if (*fd > STDERR_FILENO) {
+        return true;
+    }
+    moved = fcntl(*fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    if (moved < 0) {
+        return false;
+    }
+    (void)close(*fd);
+    *fd = moved;
+    return true;
+}
+
+static bool pipe_cloexec(int fds[2])
+{
+#ifdef __linux__
+    return pipe2(fds, O_CLOEXEC) == 0;
+#else
+    if (pipe(fds) != 0) {
+        return false;
+    }
+    if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0) {
+        int saved = errno;
+
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        errno = saved;
+        return false;
+    }
+    return true;
+#endif
+}
+
+static int open_log_fd(const char *path)
+{
+    int fd = -1;
+
+    if (path != NULL) {
+        fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    }
+    if (fd < 0) {
+        fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    }
+    if (fd >= 0 && !move_above_stdio(&fd)) {
+        (void)close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static pid_t spawn_child(krtsp_source *source, int *read_fd)
 {
     char *argv[KRTSP_ARGV_MAX];
     char storage[KRTSP_ARGV_STORAGE_MAX];
     krtsp_args_request request;
-    int fds[2];
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    sigset_t defaults;
+    sigset_t mask;
+    int fds[2] = {-1, -1};
+    int err_fd = -1;
+    bool decode = (source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u;
+    short flags;
     pid_t pid;
+    int rc;
 
-    krtsp_args_request_init(&request);
-    request.url = source->url;
-    request.width = source->options.width;
-    request.height = source->options.height;
-    request.fps_cap = source->options.fps_cap;
-    request.pixfmt = source->options.pixfmt;
-    request.low_latency = source->options.low_latency;
-    request.letterbox = source->options.letterbox;
-    request.legacy_timeout_flag = source->legacy_timeout;
-    request.roles = source->roles;
-    request.record_dir = source->options.record_dir;
-    request.record_pattern = source->options.record_pattern;
-    request.segment_seconds = source->options.segment_seconds;
-    request.record_audio = source->options.record_audio;
-    request.segment_mkdir = source->segment_mkdir;
-    request.segment_list = source->segment_list[0] != '\0'
-                               ? source->segment_list
-                               : NULL;
-    /* Each spawn starts its own grace period: a restarted segmenter has
-     * legitimately written nothing yet, and carrying the previous run's
-     * observation forward would restart-loop it. */
-    atomic_store(&source->segment_seen_ms, 0);
+    *read_fd = -1;
+    fill_args_request(source, &request);
 
     if (krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
                          sizeof(storage)) == 0u) {
@@ -311,61 +474,88 @@ static pid_t spawn_child(krtsp_source *source, int *read_fd)
     }
     argv[0] = source->ffmpeg;
 
-    if (pipe(fds) != 0) {
-        return -1;
+    if (decode && (!pipe_cloexec(fds) || !move_above_stdio(&fds[0]) ||
+                   !move_above_stdio(&fds[1]))) {
+        goto fail;
     }
-    pid = fork();
-    if (pid < 0) {
-        (void)close(fds[0]);
+    err_fd = open_log_fd(source->options.log_path);
+    if (err_fd < 0 || posix_spawn_file_actions_init(&actions) != 0) {
+        goto fail;
+    }
+    if (posix_spawnattr_init(&attributes) != 0) {
+        (void)posix_spawn_file_actions_destroy(&actions);
+        goto fail;
+    }
+    if (sigemptyset(&defaults) != 0 || sigaddset(&defaults, SIGPIPE) != 0 ||
+        sigaddset(&defaults, SIGHUP) != 0 ||
+        sigaddset(&defaults, SIGINT) != 0 ||
+        sigaddset(&defaults, SIGQUIT) != 0 ||
+        sigaddset(&defaults, SIGTERM) != 0 || sigemptyset(&mask) != 0 ||
+        posix_spawnattr_setsigdefault(&attributes, &defaults) != 0 ||
+        posix_spawnattr_setsigmask(&attributes, &mask) != 0) {
+        goto actions_fail;
+    }
+    flags = (short)(POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
+    if (posix_spawnattr_setflags(&attributes, flags) != 0 ||
+        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null",
+                                         O_RDONLY, 0) != 0 ||
+        posix_spawn_file_actions_adddup2(&actions, err_fd, STDERR_FILENO) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, err_fd) != 0) {
+        goto actions_fail;
+    }
+    if (decode) {
+        if (posix_spawn_file_actions_adddup2(&actions, fds[1],
+                                             STDOUT_FILENO) != 0 ||
+            posix_spawn_file_actions_addclose(&actions, fds[0]) != 0 ||
+            posix_spawn_file_actions_addclose(&actions, fds[1]) != 0) {
+            goto actions_fail;
+        }
+    } else if (posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+                                                 "/dev/null", O_WRONLY, 0) !=
+               0) {
+        goto actions_fail;
+    }
+
+    rc = posix_spawnp(&pid, source->ffmpeg, &actions, &attributes, argv,
+                      environ);
+    (void)posix_spawnattr_destroy(&attributes);
+    (void)posix_spawn_file_actions_destroy(&actions);
+    (void)close(err_fd);
+    err_fd = -1;
+    if (rc != 0) {
+        errno = rc;
+        goto fail;
+    }
+    if (decode) {
         (void)close(fds[1]);
-        return -1;
+        *read_fd = fds[0];
     }
-    if (pid == 0) {
-        /* Child. */
-        (void)close(fds[0]);
-        if (dup2(fds[1], STDOUT_FILENO) < 0) {
-            _exit(127);
-        }
-        (void)close(fds[1]);
-
-        /* stdin from /dev/null, reinforcing -nostdin: otherwise ffmpeg
-         * competes with the viewer for terminal input. */
-        int null_fd = open("/dev/null", O_RDONLY);
-        if (null_fd >= 0) {
-            (void)dup2(null_fd, STDIN_FILENO);
-            (void)close(null_fd);
-        }
-
-        /* stderr to the log or to /dev/null - never to the terminal,
-         * where it would corrupt the alternate screen. */
-        int err_fd = -1;
-        if (source->options.log_path != NULL) {
-            err_fd = open(source->options.log_path,
-                          O_WRONLY | O_CREAT | O_APPEND, 0600);
-        }
-        if (err_fd < 0) {
-            err_fd = open("/dev/null", O_WRONLY);
-        }
-        if (err_fd >= 0) {
-            (void)dup2(err_fd, STDERR_FILENO);
-            (void)close(err_fd);
-        }
-
-        /* Restore default signal handling: a handler inherited from the
-         * parent has no meaning in the child. */
-        (void)signal(SIGPIPE, SIG_DFL);
-        (void)signal(SIGINT, SIG_DFL);
-        (void)signal(SIGTERM, SIG_DFL);
-
-        execvp(source->ffmpeg, argv);
-        _exit(127);
-    }
-
-    /* Parent. */
-    (void)close(fds[1]);
-    (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-    *read_fd = fds[0];
     return pid;
+
+actions_fail:
+    (void)posix_spawnattr_destroy(&attributes);
+    (void)posix_spawn_file_actions_destroy(&actions);
+fail:
+    if (err_fd >= 0) {
+        (void)close(err_fd);
+    }
+    if (fds[0] >= 0) {
+        (void)close(fds[0]);
+    }
+    if (fds[1] >= 0) {
+        (void)close(fds[1]);
+    }
+    return -1;
+}
+
+static pid_t waitpid_nointr(pid_t pid, int *status, int options)
+{
+    pid_t waited;
+
+    do {
+        waited = waitpid(pid, status, options);
+    } while (waited < 0 && errno == EINTR);
+    return waited;
 }
 
 /* SIGTERM, then SIGKILL: ffmpeg holding an RTSP session open does not
@@ -379,7 +569,12 @@ static void terminate_child(pid_t pid)
     }
     (void)kill(pid, SIGTERM);
     while (waited_ms < 2000) {
-        if (waitpid(pid, NULL, WNOHANG) == pid) {
+        pid_t waited = waitpid_nointr(pid, NULL, WNOHANG);
+
+        if (waited == pid) {
+            return;
+        }
+        if (waited < 0) {
             return;
         }
         struct timespec pause = {0, 50 * 1000000L};
@@ -387,7 +582,7 @@ static void terminate_child(pid_t pid)
         waited_ms += 50;
     }
     (void)kill(pid, SIGKILL);
-    (void)waitpid(pid, NULL, 0);
+    (void)waitpid_nointr(pid, NULL, 0);
 }
 
 /* ------------------------------- threads -------------------------------- */
@@ -417,7 +612,14 @@ static void *reader_main(void *argument)
         }
         krtsp_frame_publish(source->frame, NULL);
         atomic_fetch_add(&source->frames, 1ull);
-        atomic_store(&source->last_frame_ms, monotonic_ms());
+        {
+            long long now = monotonic_ms();
+            long long not_online = 0;
+
+            atomic_store(&source->last_frame_ms, now);
+            (void)atomic_compare_exchange_strong(
+                &source->decode_online_since_ms, &not_online, now);
+        }
         atomic_store(&source->status, (int)KRTSP_ONLINE);
     }
     return NULL;
@@ -431,7 +633,14 @@ static bool sleep_until_stop(krtsp_source *source, int milliseconds)
     if (milliseconds <= 0) {
         return false;
     }
-    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        bool stopping;
+
+        pthread_mutex_lock(&source->lock);
+        stopping = source->stopping;
+        pthread_mutex_unlock(&source->lock);
+        return stopping;
+    }
     deadline.tv_sec += milliseconds / 1000;
     deadline.tv_nsec += (long)(milliseconds % 1000) * 1000000L;
     if (deadline.tv_nsec >= 1000000000L) {
@@ -441,8 +650,10 @@ static bool sleep_until_stop(krtsp_source *source, int milliseconds)
 
     pthread_mutex_lock(&source->lock);
     while (!source->stopping) {
-        if (pthread_cond_timedwait(&source->wakeup, &source->lock,
-                                   &deadline) == ETIMEDOUT) {
+        int rc = pthread_cond_timedwait(&source->wakeup, &source->lock,
+                                        &deadline);
+
+        if (rc != 0) {
             break;
         }
     }
@@ -461,6 +672,40 @@ static bool is_stopping(krtsp_source *source)
     return stopping;
 }
 
+static void set_role_status(krtsp_source *source, krtsp_status status)
+{
+    if ((source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u) {
+        atomic_store(&source->status, (int)status);
+    }
+    if ((source->roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
+        atomic_store(&source->record_status, (int)status);
+    }
+}
+
+static int next_backoff(int current, int maximum)
+{
+    return current > maximum / 2 ? maximum : current * 2;
+}
+
+static bool roles_were_stable(const krtsp_source *source, long long now)
+{
+    if ((source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u) {
+        long long since = atomic_load(&source->decode_online_since_ms);
+
+        if (since <= 0 || now - since < source->options.stable_ms) {
+            return false;
+        }
+    }
+    if ((source->roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
+        long long since = atomic_load(&source->record_online_since_ms);
+
+        if (since <= 0 || now - since < source->options.stable_ms) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void *supervisor_main(void *argument)
 {
     krtsp_source *source = argument;
@@ -473,22 +718,30 @@ static void *supervisor_main(void *argument)
         long long started;
         bool stalled = false;
 
-        atomic_store(&source->status, (int)KRTSP_STARTING);
+        set_role_status(source, KRTSP_STARTING);
+        atomic_store(&source->decode_online_since_ms, 0);
+        atomic_store(&source->record_online_since_ms, 0);
+        atomic_store(&source->segment_seen_ms, 0);
+        if ((source->roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
+            /* An old manifest proves only that a previous run recorded.
+             * Snapshot it before spawning and require this run to change it. */
+            source->segment_mtime_ns =
+                segment_mtime_ns(source->segment_list);
+        }
         pid = spawn_child(source, &read_fd);
         if (pid < 0) {
-            atomic_store(&source->status, (int)KRTSP_OFFLINE);
+            set_role_status(source, KRTSP_OFFLINE);
             atomic_fetch_add(&source->consecutive_failures, 1);
             if (source->options.max_consecutive_failures > 0 &&
                 atomic_load(&source->consecutive_failures) >=
                     source->options.max_consecutive_failures) {
-                atomic_store(&source->status, (int)KRTSP_FAILED);
+                set_role_status(source, KRTSP_FAILED);
                 break;
             }
             if (sleep_until_stop(source, backoff)) {
                 break;
             }
-            backoff = backoff * 2 < source->options.backoff_max_ms
-                ? backoff * 2 : source->options.backoff_max_ms;
+            backoff = next_backoff(backoff, source->options.backoff_max_ms);
             continue;
         }
         if (!first) {
@@ -504,19 +757,31 @@ static void *supervisor_main(void *argument)
         source->pipe_read = read_fd;
         pthread_mutex_unlock(&source->lock);
 
-        if (pthread_create(&source->reader, NULL, reader_main, source) != 0) {
+        if ((source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u &&
+            pthread_create(&source->reader, NULL, reader_main, source) != 0) {
             terminate_child(pid);
             (void)close(read_fd);
             pthread_mutex_lock(&source->lock);
             source->child = -1;
             source->pipe_read = -1;
             pthread_mutex_unlock(&source->lock);
+            set_role_status(source, KRTSP_OFFLINE);
+            atomic_fetch_add(&source->consecutive_failures, 1);
+            if (source->options.max_consecutive_failures > 0 &&
+                atomic_load(&source->consecutive_failures) >=
+                    source->options.max_consecutive_failures) {
+                set_role_status(source, KRTSP_FAILED);
+                break;
+            }
             if (sleep_until_stop(source, backoff)) {
                 break;
             }
+            backoff = next_backoff(backoff,
+                                   source->options.backoff_max_ms);
             continue;
         }
-        source->reader_started = true;
+        source->reader_started =
+            (source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u;
 
         /* One-second watch, the interval Frigate settled on: slow enough
          * to be free, fast enough that a wedge is noticed in time. */
@@ -527,12 +792,13 @@ static void *supervisor_main(void *argument)
             if (sleep_until_stop(source, 1000)) {
                 break;
             }
-            if (waitpid(pid, &status_value, WNOHANG) == pid) {
+            pid_t waited = waitpid_nointr(pid, &status_value, WNOHANG);
+
+            if (waited == pid || (waited < 0 && errno == ECHILD)) {
                 /* Exited on its own; the reader will see EOF. */
                 pthread_mutex_lock(&source->lock);
                 source->child = -1;
                 pthread_mutex_unlock(&source->lock);
-                pid = -1;
                 break;
             }
             now = monotonic_ms();
@@ -545,8 +811,8 @@ static void *supervisor_main(void *argument)
              * both, so each sink gets its own.
              */
             if ((source->roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
-                long long mtime = segment_mtime_ms(source->segment_list);
-                int segment_stall = source->options.segment_stall_ms;
+                long long mtime = segment_mtime_ns(source->segment_list);
+                long long segment_stall = source->options.segment_stall_ms;
                 long long seen;
 
                 if (segment_stall <= 0) {
@@ -555,11 +821,15 @@ static void *supervisor_main(void *argument)
                                       : 10;
                     /* Three rotations: tolerant of one missed segment,
                      * intolerant of a dead sink. */
-                    segment_stall = seconds * 3000;
+                    segment_stall = (long long)seconds * 3000;
                 }
-                if (mtime > source->segment_mtime) {
-                    source->segment_mtime = mtime;
+                if (mtime != 0 && mtime != source->segment_mtime_ns) {
+                    long long not_online = 0;
+
+                    source->segment_mtime_ns = mtime;
                     atomic_store(&source->segment_seen_ms, now);
+                    (void)atomic_compare_exchange_strong(
+                        &source->record_online_since_ms, &not_online, now);
                     atomic_store(&source->record_status, (int)KRTSP_ONLINE);
                 }
                 seen = atomic_load(&source->segment_seen_ms);
@@ -629,21 +899,16 @@ static void *supervisor_main(void *argument)
         if (fd_to_close >= 0) {
             (void)close(fd_to_close);
         }
-        if (pid > 0) {
-            (void)waitpid(pid, NULL, WNOHANG);
-        }
-
         if (is_stopping(source)) {
             break;
         }
 
-        atomic_store(&source->status, (int)KRTSP_OFFLINE);
+        set_role_status(source, KRTSP_OFFLINE);
 
         /* Reset the backoff only after a sustained online period.  On the
          * first frame instead, a camera that delivers one frame and dies
          * would spin in a tight restart loop forever. */
-        if (!stalled &&
-            monotonic_ms() - started > source->options.stable_ms) {
+        if (!stalled && roles_were_stable(source, monotonic_ms())) {
             backoff = source->options.backoff_min_ms;
             atomic_store(&source->consecutive_failures, 0);
         } else {
@@ -653,19 +918,46 @@ static void *supervisor_main(void *argument)
         if (source->options.max_consecutive_failures > 0 &&
             atomic_load(&source->consecutive_failures) >=
                 source->options.max_consecutive_failures) {
-            atomic_store(&source->status, (int)KRTSP_FAILED);
+            set_role_status(source, KRTSP_FAILED);
             break;
         }
         if (sleep_until_stop(source, backoff)) {
             break;
         }
-        backoff = backoff * 2 < source->options.backoff_max_ms
-            ? backoff * 2 : source->options.backoff_max_ms;
+        backoff = next_backoff(backoff, source->options.backoff_max_ms);
     }
     return NULL;
 }
 
 /* -------------------------------- public -------------------------------- */
+
+static void free_source_storage(krtsp_source *source)
+{
+    if (source == NULL) {
+        return;
+    }
+    krtsp_frame_free(source->frame);
+    free(source->owned_record_pattern);
+    free(source->owned_record_dir);
+    free(source->owned_log_path);
+    free(source);
+}
+
+static bool copy_option_string(char **owned, const char **option,
+                               const char *value)
+{
+    if (value == NULL) {
+        *owned = NULL;
+        *option = NULL;
+        return true;
+    }
+    *owned = strdup(value);
+    if (*owned == NULL) {
+        return false;
+    }
+    *option = *owned;
+    return true;
+}
 
 bool krtsp_source_start(
     krtsp_source **out,
@@ -675,6 +967,7 @@ bool krtsp_source_start(
     krtsp_source_options defaults;
     krtsp_source *source;
     const char *binary;
+    unsigned roles;
 
     if (out == NULL) {
         return false;
@@ -687,31 +980,27 @@ bool krtsp_source_start(
         krtsp_source_options_init(&defaults);
         options = &defaults;
     }
-    {
-        unsigned roles = options->roles != 0u
-                             ? options->roles
-                             : (unsigned)KRTSP_ROLE_DECODE;
-
-        if ((roles & ~(unsigned)(KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD)) !=
-            0u) {
-            return false;
-        }
-        /* Frame geometry is only meaningful to the decode sink; a
-         * record-only source has no decoded frames to size. */
-        if ((roles & (unsigned)KRTSP_ROLE_DECODE) != 0u &&
-            (options->width <= 0 || options->height <= 0)) {
-            return false;
-        }
-        if ((roles & (unsigned)KRTSP_ROLE_RECORD) != 0u &&
-            (options->record_dir == NULL ||
-             options->record_dir[0] == '\0')) {
-            return false;
-        }
-        if (options->segment_seconds < 0 || options->segment_stall_ms < 0) {
-            return false;
-        }
+    roles = options->roles != 0u ? options->roles
+                                 : (unsigned)KRTSP_ROLE_DECODE;
+    if ((roles & ~(unsigned)(KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD)) != 0u) {
+        return false;
     }
-    if (options->stall_ms <= 0 || options->grace_ms < 0 ||
+    /* Frame geometry and pixel format are meaningful only to the decode
+     * sink; a record-only source allocates no decoded frame. */
+    if ((roles & (unsigned)KRTSP_ROLE_DECODE) != 0u &&
+        (options->width <= 0 || options->height <= 0 ||
+         (options->pixfmt != KRTSP_PIXFMT_RGBA &&
+          options->pixfmt != KRTSP_PIXFMT_BGRA))) {
+        return false;
+    }
+    if ((roles & (unsigned)KRTSP_ROLE_RECORD) != 0u &&
+        (options->record_dir == NULL || options->record_dir[0] == '\0')) {
+        return false;
+    }
+    if (options->fps_cap < 0 || options->segment_seconds < 0 ||
+        options->segment_stall_ms < 0 || options->stall_ms <= 0 ||
+        options->grace_ms < 0 || options->stable_ms < 0 ||
+        options->max_consecutive_failures < 0 ||
         options->backoff_min_ms <= 0 ||
         options->backoff_max_ms < options->backoff_min_ms) {
         return false;
@@ -726,8 +1015,20 @@ bool krtsp_source_start(
     }
     (void)snprintf(source->url, sizeof(source->url), "%s", url);
     source->options = *options;
+    source->roles = roles;
     source->child = -1;
     source->pipe_read = -1;
+    if (!copy_option_string(&source->owned_log_path,
+                            &source->options.log_path, options->log_path) ||
+        !copy_option_string(&source->owned_record_dir,
+                            &source->options.record_dir,
+                            options->record_dir) ||
+        !copy_option_string(&source->owned_record_pattern,
+                            &source->options.record_pattern,
+                            options->record_pattern)) {
+        free_source_storage(source);
+        return false;
+    }
 
     binary = options->ffmpeg_path;
     if (binary == NULL || binary[0] == '\0') {
@@ -737,23 +1038,24 @@ bool krtsp_source_start(
         binary = "ffmpeg";
     }
     if (strlen(binary) >= sizeof(source->ffmpeg)) {
-        free(source);
+        free_source_storage(source);
         return false;
     }
     (void)snprintf(source->ffmpeg, sizeof(source->ffmpeg), "%s", binary);
     source->legacy_timeout = krtsp_ffmpeg_needs_legacy_timeout(source->ffmpeg);
 
-    source->roles = options->roles != 0u ? options->roles
-                                        : (unsigned)KRTSP_ROLE_DECODE;
     if ((source->roles & (unsigned)KRTSP_ROLE_RECORD) != 0u) {
         /* Probed, not assumed: ffmpeg 5.1 has -strftime but not
          * -strftime_mkdir, and passing a flag the binary lacks fails the
          * spawn outright. */
         source->segment_mkdir =
             krtsp_ffmpeg_supports_segment_mkdir(source->ffmpeg);
-        if (snprintf(source->segment_list, sizeof(source->segment_list),
-                     "%s/.segments", options->record_dir) < 0) {
-            free(source);
+        int printed = snprintf(source->segment_list,
+                               sizeof(source->segment_list), "%s/.segments",
+                               source->options.record_dir);
+
+        if (printed < 0 || (size_t)printed >= sizeof(source->segment_list)) {
+            free_source_storage(source);
             return false;
         }
         atomic_store(&source->record_status, (int)KRTSP_STARTING);
@@ -761,25 +1063,51 @@ bool krtsp_source_start(
         atomic_store(&source->record_status, (int)KRTSP_OFFLINE);
     }
 
+    /* A too-long URL/path combination is an argument error, not a camera
+     * outage to retry forever from the supervisor thread. */
+    {
+        krtsp_args_request request;
+        char *argv[KRTSP_ARGV_MAX];
+        char storage[KRTSP_ARGV_STORAGE_MAX];
+
+        fill_args_request(source, &request);
+        if (krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
+                             sizeof(storage)) == 0u) {
+            free_source_storage(source);
+            return false;
+        }
+    }
+
     if ((source->roles & (unsigned)KRTSP_ROLE_DECODE) != 0u) {
-        if (!krtsp_frame_init(&source->frame, options->width,
-                              options->height)) {
-            free(source);
+        if (!krtsp_frame_init(&source->frame, source->options.width,
+                              source->options.height)) {
+            free_source_storage(source);
             return false;
         }
         source->frame_size = krtsp_frame_size(source->frame);
     }
 
     if (pthread_mutex_init(&source->lock, NULL) != 0) {
-        krtsp_frame_free(source->frame);
-        free(source);
+        free_source_storage(source);
         return false;
     }
-    if (pthread_cond_init(&source->wakeup, NULL) != 0) {
-        (void)pthread_mutex_destroy(&source->lock);
-        krtsp_frame_free(source->frame);
-        free(source);
-        return false;
+    {
+        pthread_condattr_t attributes;
+        bool initialized = pthread_condattr_init(&attributes) == 0;
+        bool ready = initialized;
+
+        if (ready) {
+            ready = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0;
+        }
+        if (!ready || pthread_cond_init(&source->wakeup, &attributes) != 0) {
+            if (initialized) {
+                (void)pthread_condattr_destroy(&attributes);
+            }
+            (void)pthread_mutex_destroy(&source->lock);
+            free_source_storage(source);
+            return false;
+        }
+        (void)pthread_condattr_destroy(&attributes);
     }
     atomic_store(&source->status, (int)KRTSP_STARTING);
 
@@ -787,8 +1115,7 @@ bool krtsp_source_start(
                        source) != 0) {
         (void)pthread_cond_destroy(&source->wakeup);
         (void)pthread_mutex_destroy(&source->lock);
-        krtsp_frame_free(source->frame);
-        free(source);
+        free_source_storage(source);
         return false;
     }
     source->supervisor_started = true;
@@ -818,16 +1145,21 @@ void krtsp_source_stop(krtsp_source *source)
     }
     (void)pthread_cond_destroy(&source->wakeup);
     (void)pthread_mutex_destroy(&source->lock);
-    krtsp_frame_free(source->frame);
-    free(source);
+    free_source_storage(source);
 }
 
 const uint8_t *krtsp_source_borrow(krtsp_source *source, int *age_ms)
 {
+    return krtsp_source_borrow_latest(source, NULL, age_ms);
+}
+
+const uint8_t *krtsp_source_borrow_latest(
+    krtsp_source *source, uint64_t *sequence, int *age_ms)
+{
     if (source == NULL) {
         return NULL;
     }
-    return krtsp_frame_borrow(source->frame, NULL, age_ms);
+    return krtsp_frame_borrow(source->frame, sequence, age_ms);
 }
 
 void krtsp_source_release(krtsp_source *source)
@@ -842,6 +1174,9 @@ krtsp_status krtsp_source_role_status(
     const krtsp_source *source, krtsp_role role)
 {
     if (source == NULL) {
+        return KRTSP_FAILED;
+    }
+    if (role != KRTSP_ROLE_DECODE && role != KRTSP_ROLE_RECORD) {
         return KRTSP_FAILED;
     }
     if ((source->roles & (unsigned)role) == 0u) {
@@ -914,4 +1249,27 @@ void krtsp_source_get_stats(
     out->stalls = atomic_load(&mutable_source->stalls);
     out->consecutive_failures =
         atomic_load(&mutable_source->consecutive_failures);
+}
+
+uint64_t krtsp_source_frame_count(const krtsp_source *source)
+{
+    return source != NULL
+               ? (uint64_t)atomic_load(
+                     &((krtsp_source *)source)->frames)
+               : 0u;
+}
+
+int krtsp_source_frame_age_ms(const krtsp_source *source)
+{
+    long long age;
+
+    if (source == NULL || krtsp_source_frame_count(source) == 0u) {
+        return -1;
+    }
+    age = monotonic_ms() -
+          atomic_load(&((krtsp_source *)source)->last_frame_ms);
+    if (age < 0) {
+        age = 0;
+    }
+    return age > INT_MAX ? INT_MAX : (int)age;
 }

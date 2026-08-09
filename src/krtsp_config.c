@@ -25,6 +25,7 @@
 #include "kilix_rtsp.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,54 +80,123 @@ static char *trim(char *text)
 
 /* Parse [kind "name"] into kind and name.  Returns false when the line is
  * not a section header of that shape. */
-static bool parse_section(char *line, char *kind, size_t kind_capacity,
+static bool identifier_character(unsigned char character)
+{
+    return (character >= 'a' && character <= 'z') ||
+           (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9') || character == '-' ||
+           character == '_';
+}
+
+static bool safe_name(const char *name)
+{
+    size_t length;
+
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+    length = strlen(name);
+    if (name[0] == ' ' || name[length - 1u] == ' ') {
+        return false;
+    }
+    for (const unsigned char *scan = (const unsigned char *)name;
+         *scan != '\0'; ++scan) {
+        if (*scan < 0x20u || *scan == 0x7fu || *scan == ',') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool safe_value(const char *value)
+{
+    if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+    for (const unsigned char *scan = (const unsigned char *)value;
+         *scan != '\0'; ++scan) {
+        if (*scan < 0x20u || *scan == 0x7fu) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool safe_key(const char *key)
+{
+    if (key == NULL || key[0] == '\0') {
+        return false;
+    }
+    for (const unsigned char *scan = (const unsigned char *)key;
+         *scan != '\0'; ++scan) {
+        if (!identifier_character(*scan)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_section(const char *line, char *kind, size_t kind_capacity,
                           char *name, size_t name_capacity)
 {
-    char *close_bracket;
-    char *first_quote;
-    char *last_quote;
+    const char *scan = line;
+    const char *kind_start;
+    const char *name_start;
     size_t kind_length;
     size_t name_length;
 
-    if (line[0] != '[') {
+    if (*scan++ != '[') {
         return false;
     }
-    close_bracket = strrchr(line, ']');
-    if (close_bracket == NULL) {
+    while (*scan == ' ' || *scan == '\t') {
+        scan++;
+    }
+    kind_start = scan;
+    while (identifier_character((unsigned char)*scan)) {
+        scan++;
+    }
+    kind_length = (size_t)(scan - kind_start);
+    if (kind_length == 0u || kind_length >= kind_capacity ||
+        (*scan != ' ' && *scan != '\t')) {
         return false;
     }
-    *close_bracket = '\0';
-    first_quote = strchr(line + 1, '"');
-    if (first_quote == NULL) {
+    while (*scan == ' ' || *scan == '\t') {
+        scan++;
+    }
+    if (*scan++ != '"') {
         return false;
     }
-    last_quote = strrchr(first_quote + 1, '"');
-    if (last_quote == NULL || last_quote == first_quote) {
-        return false;
+    name_start = scan;
+    while (*scan != '\0' && *scan != '"') {
+        scan++;
     }
-    *last_quote = '\0';
-
-    {
-        char *kind_text = line + 1;
-        char *kind_end = first_quote;
-
-        while (kind_end > kind_text &&
-               (kind_end[-1] == ' ' || kind_end[-1] == '\t')) {
-            kind_end--;
-        }
-        *kind_end = '\0';
-        kind_text = trim(kind_text);
-        kind_length = strlen(kind_text);
-        if (kind_length == 0u || kind_length >= kind_capacity) {
-            return false;
-        }
-        memcpy(kind, kind_text, kind_length + 1u);
-    }
-    name_length = strlen(first_quote + 1);
+    name_length = (size_t)(scan - name_start);
     if (name_length == 0u || name_length >= name_capacity) {
         return false;
     }
-    memcpy(name, first_quote + 1, name_length + 1u);
+    if (*scan++ != '"') {
+        return false;
+    }
+    while (*scan == ' ' || *scan == '\t') {
+        scan++;
+    }
+    if (*scan++ != ']') {
+        return false;
+    }
+    while (*scan == ' ' || *scan == '\t') {
+        scan++;
+    }
+    if (*scan != '\0') {
+        return false;
+    }
+
+    memcpy(kind, kind_start, kind_length);
+    kind[kind_length] = '\0';
+    memcpy(name, name_start, name_length);
+    name[name_length] = '\0';
+    if (!safe_name(name)) {
+        return false;
+    }
     return true;
 }
 
@@ -156,35 +226,158 @@ static bool copy_field(char *destination, size_t capacity, const char *source)
     return true;
 }
 
-/* Check ownership and permissions before reading a file of passwords. */
-static bool credential_file_is_safe(
+/* Open first and validate that exact descriptor.  A stat(path) followed by
+ * fopen(path) lets a rename swap in a different file between the checks. */
+static FILE *open_credential_file(
     const char *path, char *error, size_t error_capacity)
 {
     struct stat info;
+    FILE *handle;
+    int status_flags;
+    int fd;
 
-    if (stat(path, &info) != 0) {
-        set_error(error, error_capacity, "cannot stat %s: %s", path,
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        if (errno == ELOOP) {
+            set_error(error, error_capacity,
+                      "%s is a symbolic link; use the credential file itself",
+                      path);
+        } else {
+            set_error(error, error_capacity, "cannot open %s: %s", path,
+                      strerror(errno));
+        }
+        return NULL;
+    }
+    if (fstat(fd, &info) != 0) {
+        set_error(error, error_capacity, "cannot inspect %s: %s", path,
                   strerror(errno));
-        return false;
+        (void)close(fd);
+        return NULL;
     }
     if (!S_ISREG(info.st_mode)) {
         set_error(error, error_capacity, "%s is not a regular file", path);
-        return false;
+        (void)close(fd);
+        return NULL;
     }
     if (info.st_uid != geteuid()) {
         set_error(error, error_capacity,
                   "%s is owned by uid %ld, not by this user", path,
                   (long)info.st_uid);
-        return false;
+        (void)close(fd);
+        return NULL;
     }
     if ((info.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
         set_error(error, error_capacity,
                   "%s is readable by others (mode %04o); it holds camera "
                   "passwords - run: chmod 600 %s",
                   path, (unsigned)(info.st_mode & 07777), path);
-        return false;
+        (void)close(fd);
+        return NULL;
     }
-    return true;
+    status_flags = fcntl(fd, F_GETFL);
+    if (status_flags < 0 ||
+        fcntl(fd, F_SETFL, status_flags & ~O_NONBLOCK) != 0) {
+        set_error(error, error_capacity, "cannot prepare %s: %s", path,
+                  strerror(errno));
+        (void)close(fd);
+        return NULL;
+    }
+    handle = fdopen(fd, "r");
+    if (handle == NULL) {
+        set_error(error, error_capacity, "cannot read %s: %s", path,
+                  strerror(errno));
+        (void)close(fd);
+        return NULL;
+    }
+    return handle;
+}
+
+typedef enum config_line_result {
+    CONFIG_LINE_END = 0,
+    CONFIG_LINE_OK,
+    CONFIG_LINE_TOO_LONG,
+    CONFIG_LINE_BINARY,
+    CONFIG_LINE_IO_ERROR
+} config_line_result;
+
+static config_line_result read_config_line(FILE *handle, char *line,
+                                           size_t capacity)
+{
+    size_t used = 0u;
+
+    for (;;) {
+        int character = fgetc(handle);
+
+        if (character == EOF) {
+            if (ferror(handle)) {
+                return CONFIG_LINE_IO_ERROR;
+            }
+            if (used == 0u) {
+                return CONFIG_LINE_END;
+            }
+            line[used] = '\0';
+            return CONFIG_LINE_OK;
+        }
+        if (character == 0) {
+            return CONFIG_LINE_BINARY;
+        }
+        if (character == '\n') {
+            line[used] = '\0';
+            return CONFIG_LINE_OK;
+        }
+        if (used + 1u >= capacity) {
+            return CONFIG_LINE_TOO_LONG;
+        }
+        line[used++] = (char)character;
+    }
+}
+
+static bool add_group_members(krtsp_group *group, char *value,
+                              int line_number, char *error,
+                              size_t error_capacity)
+{
+    char *cursor = value;
+
+    for (;;) {
+        char *comma = strchr(cursor, ',');
+        char *member;
+
+        if (comma != NULL) {
+            *comma = '\0';
+        }
+        member = trim(cursor);
+        if (!safe_name(member)) {
+            set_error(error, error_capacity,
+                      "line %d: empty or invalid camera name in group '%s'",
+                      line_number, group->name);
+            return false;
+        }
+        for (size_t index = 0u; index < group->member_count; ++index) {
+            if (strcmp(group->members[index], member) == 0) {
+                set_error(error, error_capacity,
+                          "line %d: duplicate camera '%s' in group '%s'",
+                          line_number, member, group->name);
+                return false;
+            }
+        }
+        if (group->member_count >= KRTSP_GROUP_MEMBERS_MAX) {
+            set_error(error, error_capacity,
+                      "line %d: too many cameras in group '%s'", line_number,
+                      group->name);
+            return false;
+        }
+        if (!copy_field(group->members[group->member_count], KRTSP_NAME_MAX,
+                        member)) {
+            set_error(error, error_capacity,
+                      "line %d: camera name too long", line_number);
+            return false;
+        }
+        group->member_count++;
+        if (comma == NULL) {
+            return true;
+        }
+        cursor = comma + 1;
+    }
 }
 
 bool krtsp_config_load(
@@ -218,20 +411,19 @@ bool krtsp_config_load(
                       strerror(errno));
             return false;
         }
-        if (snprintf(resolved, sizeof(resolved), "%s/cameras.conf",
-                     directory) < 0) {
+        int printed = snprintf(resolved, sizeof(resolved), "%s/cameras.conf",
+                               directory);
+
+        if (printed < 0 || (size_t)printed >= sizeof(resolved)) {
+            set_error(error, error_capacity,
+                      "configuration path is too long");
             return false;
         }
         path = resolved;
     }
 
-    if (!credential_file_is_safe(path, error, error_capacity)) {
-        return false;
-    }
-    handle = fopen(path, "r");
+    handle = open_credential_file(path, error, error_capacity);
     if (handle == NULL) {
-        set_error(error, error_capacity, "cannot open %s: %s", path,
-                  strerror(errno));
         return false;
     }
     config = calloc(1u, sizeof(*config));
@@ -241,12 +433,35 @@ bool krtsp_config_load(
         return false;
     }
 
-    while (fgets(line, sizeof(line), handle) != NULL) {
+    for (;;) {
         char *text;
         char *key;
         char *value;
+        config_line_result line_result =
+            read_config_line(handle, line, sizeof(line));
+
+        if (line_result == CONFIG_LINE_END) {
+            break;
+        }
 
         line_number++;
+        if (line_result != CONFIG_LINE_OK) {
+            if (line_result == CONFIG_LINE_TOO_LONG) {
+                set_error(error, error_capacity,
+                          "line %d: longer than %zu bytes", line_number,
+                          sizeof(line) - 1u);
+            } else if (line_result == CONFIG_LINE_BINARY) {
+                set_error(error, error_capacity,
+                          "line %d: configuration contains a NUL byte",
+                          line_number);
+            } else {
+                set_error(error, error_capacity,
+                          "line %d: error reading configuration: %s",
+                          line_number, strerror(errno));
+            }
+            ok = false;
+            break;
+        }
         text = trim(line);
         if (text[0] == '\0' || text[0] == '#' || text[0] == ';') {
             continue;
@@ -271,10 +486,11 @@ bool krtsp_config_load(
                     ok = false;
                     break;
                 }
-                if (krtsp_config_find(config, name) != NULL) {
+                if (krtsp_config_find(config, name) != NULL ||
+                    krtsp_config_find_group(config, name) != NULL) {
                     set_error(error, error_capacity,
-                              "line %d: duplicate camera '%s'", line_number,
-                              name);
+                              "line %d: duplicate section name '%s'",
+                              line_number, name);
                     ok = false;
                     break;
                 }
@@ -289,6 +505,14 @@ bool krtsp_config_load(
                 if (config->group_count >= KRTSP_CAMERAS_MAX) {
                     set_error(error, error_capacity,
                               "line %d: too many groups", line_number);
+                    ok = false;
+                    break;
+                }
+                if (krtsp_config_find(config, name) != NULL ||
+                    krtsp_config_find_group(config, name) != NULL) {
+                    set_error(error, error_capacity,
+                              "line %d: duplicate section name '%s'",
+                              line_number, name);
                     ok = false;
                     break;
                 }
@@ -315,9 +539,28 @@ bool krtsp_config_load(
             ok = false;
             break;
         }
+        if (!safe_key(key)) {
+            set_error(error, error_capacity,
+                      "line %d: invalid key", line_number);
+            ok = false;
+            break;
+        }
         if (camera != NULL) {
             /* Never echo `value`: it is a URL, and a URL is a password. */
             if (strcmp(key, "main") == 0) {
+                if (!safe_value(value)) {
+                    set_error(error, error_capacity,
+                              "line %d: main url is empty or contains a "
+                              "control character", line_number);
+                    ok = false;
+                    break;
+                }
+                if (camera->url_main[0] != '\0') {
+                    set_error(error, error_capacity,
+                              "line %d: duplicate main url", line_number);
+                    ok = false;
+                    break;
+                }
                 if (!copy_field(camera->url_main, sizeof(camera->url_main),
                                 value)) {
                     set_error(error, error_capacity,
@@ -327,6 +570,19 @@ bool krtsp_config_load(
                     break;
                 }
             } else if (strcmp(key, "sub") == 0) {
+                if (!safe_value(value)) {
+                    set_error(error, error_capacity,
+                              "line %d: sub url is empty or contains a "
+                              "control character", line_number);
+                    ok = false;
+                    break;
+                }
+                if (camera->url_sub[0] != '\0') {
+                    set_error(error, error_capacity,
+                              "line %d: duplicate sub url", line_number);
+                    ok = false;
+                    break;
+                }
                 if (!copy_field(camera->url_sub, sizeof(camera->url_sub),
                                 value)) {
                     set_error(error, error_capacity,
@@ -349,30 +605,9 @@ bool krtsp_config_load(
                 ok = false;
                 break;
             }
-            for (char *token = strtok(value, ","); token != NULL;
-                 token = strtok(NULL, ",")) {
-                char *member = trim(token);
-
-                if (member[0] == '\0') {
-                    continue;
-                }
-                if (group->member_count >= KRTSP_GROUP_MEMBERS_MAX) {
-                    set_error(error, error_capacity,
-                              "line %d: too many cameras in group '%s'",
-                              line_number, group->name);
-                    ok = false;
-                    break;
-                }
-                if (!copy_field(group->members[group->member_count],
-                                KRTSP_NAME_MAX, member)) {
-                    set_error(error, error_capacity,
-                              "line %d: camera name too long", line_number);
-                    ok = false;
-                    break;
-                }
-                group->member_count++;
-            }
-            if (!ok) {
+            if (!add_group_members(group, value, line_number, error,
+                                   error_capacity)) {
+                ok = false;
                 break;
             }
         } else {
@@ -395,6 +630,18 @@ bool krtsp_config_load(
                 set_error(error, error_capacity,
                           "camera '%s' has neither a main nor a sub url",
                           entry->name);
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok) {
+        for (size_t index = 0u; index < config->group_count; ++index) {
+            const krtsp_group *entry = &config->groups[index];
+
+            if (entry->member_count == 0u) {
+                set_error(error, error_capacity,
+                          "group '%s' has no cameras", entry->name);
                 ok = false;
                 break;
             }
@@ -489,7 +736,8 @@ const krtsp_group *krtsp_config_find_group(
 
 const char *krtsp_camera_url(const krtsp_camera *camera, krtsp_tier tier)
 {
-    if (camera == NULL) {
+    if (camera == NULL ||
+        (tier != KRTSP_TIER_MAIN && tier != KRTSP_TIER_SUB)) {
         return NULL;
     }
     if (tier == KRTSP_TIER_MAIN) {
