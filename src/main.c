@@ -9,11 +9,12 @@
  */
 
 #include "kilix_rtsp.h"
+#include "krtsp_exec.h"
+#include "krtsp_probe.h"
 #include "krtsp_view.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,29 @@ static void usage(FILE *stream)
         "Configuration and data live under ~/.local/gpu_terminal/kilix-rtsp,\n"
         "overridable with KILIX_RTSP_HOME.  The ffmpeg binary can be\n"
         "overridden with KILIX_RTSP_FFMPEG.\n");
+}
+
+static bool parse_nonnegative_int(const char *text, int *out)
+{
+    char *end;
+    long value;
+
+    if (text == NULL || text[0] == '\0' || out == NULL) {
+        return false;
+    }
+    for (const unsigned char *scan = (const unsigned char *)text;
+         *scan != '\0'; ++scan) {
+        if (*scan < '0' || *scan > '9') {
+            return false;
+        }
+    }
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || *end != '\0' || value < 0 || value > INT_MAX) {
+        return false;
+    }
+    *out = (int)value;
+    return true;
 }
 
 /* Load the config, or explain why not.  A missing file is not fatal for a
@@ -106,124 +130,6 @@ static int command_list(const char *config_path)
     }
     krtsp_config_free(config);
     return 0;
-}
-
-/*
- * Run ffprobe and print what it says.
- *
- * ffprobe's own -timeout governs the socket, not the process, so it is
- * backed by a hard kill here - a camera that accepts a connection and
- * then says nothing outlives the internal timeout.  That part follows
- * Frigate, which has probed a lot of cameras.
- *
- * Where this diverges: Frigate tries the default transport first and
- * retries over TCP on failure.  On this fleet UDP does not fail, it
- * succeeds emptily - exit 0, width=0, pix_fmt=unknown - so a
- * retry-on-failure never fires.  TCP goes first instead.
- */
-static int run_ffprobe(const char *url, bool force_tcp, char *output,
-                       size_t capacity, int timeout_seconds)
-{
-    const char *binary = getenv("KILIX_RTSP_FFPROBE");
-    int fds[2];
-    pid_t pid;
-    size_t used = 0u;
-    int status = -1;
-    int waited_ms = 0;
-
-    if (binary == NULL || binary[0] == '\0') {
-        binary = "ffprobe";
-    }
-    output[0] = '\0';
-    if (pipe(fds) != 0) {
-        return -1;
-    }
-    pid = fork();
-    if (pid < 0) {
-        (void)close(fds[0]);
-        (void)close(fds[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        char *argv[24];
-        size_t at = 0u;
-
-        (void)close(fds[0]);
-        (void)dup2(fds[1], STDOUT_FILENO);
-        (void)close(fds[1]);
-        {
-            int null_fd = open("/dev/null", O_WRONLY);
-
-            if (null_fd >= 0) {
-                (void)dup2(null_fd, STDERR_FILENO);
-                (void)close(null_fd);
-            }
-        }
-        argv[at++] = (char *)binary;
-        argv[at++] = (char *)"-hide_banner";
-        argv[at++] = (char *)"-loglevel";
-        argv[at++] = (char *)"error";
-        if (force_tcp) {
-            argv[at++] = (char *)"-rtsp_transport";
-            argv[at++] = (char *)"tcp";
-        }
-        argv[at++] = (char *)"-timeout";
-        argv[at++] = (char *)"5000000";
-        /*
-         * Give ffprobe enough stream to actually determine the format.
-         * Without this a low-bitrate substream returns exit 0 with
-         * width=0, pix_fmt=unknown and a nonsense frame rate - a probe
-         * that looks successful and says nothing.  A camera at 8 fps
-         * takes a while to produce a second of video.
-         */
-        argv[at++] = (char *)"-analyzeduration";
-        argv[at++] = (char *)"5000000";
-        argv[at++] = (char *)"-probesize";
-        argv[at++] = (char *)"5000000";
-        argv[at++] = (char *)"-show_entries";
-        argv[at++] = (char *)
-            "stream=index,codec_type,codec_name,profile,width,height,"
-            "pix_fmt,r_frame_rate,avg_frame_rate,has_b_frames,sample_rate,"
-            "channels";
-        argv[at++] = (char *)"-of";
-        argv[at++] = (char *)"default=noprint_wrappers=0";
-        argv[at++] = (char *)url;
-        argv[at] = NULL;
-        execvp(binary, argv);
-        _exit(127);
-    }
-
-    (void)close(fds[1]);
-    for (;;) {
-        ssize_t count = read(fds[0], output + used, capacity - used - 1u);
-
-        if (count > 0) {
-            used += (size_t)count;
-            output[used] = '\0';
-            if (used + 1u >= capacity) {
-                break;
-            }
-        } else if (count < 0 && errno == EINTR) {
-            continue;
-        } else {
-            break;
-        }
-    }
-    (void)close(fds[0]);
-
-    /* Hard bound on the child.  ffprobe's -timeout governs the socket,
-     * not the process, and a camera that accepts a connection then says
-     * nothing can outlive it. */
-    while (waited_ms < timeout_seconds * 1000) {
-        if (waitpid(pid, &status, WNOHANG) == pid) {
-            return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-        }
-        usleep(50000);
-        waited_ms += 50;
-    }
-    (void)kill(pid, SIGKILL);
-    (void)waitpid(pid, NULL, 0);
-    return -2;   /* timed out */
 }
 
 /*
@@ -309,7 +215,7 @@ static int relaunch_in_tab(char **argv, const char *label)
         return -1;
     }
     length = readlink("/proc/self/exe", self, sizeof(self) - 1u);
-    if (length <= 0) {
+    if (length <= 0 || (size_t)length >= sizeof(self) - 1u) {
         return -1;
     }
     self[length] = '\0';
@@ -338,7 +244,9 @@ static int relaunch_in_tab(char **argv, const char *label)
             continue;
         }
         if (snprintf(env_pairs[index], sizeof(env_pairs[index]), "%s=%s",
-                     forwarded[index], value) < 0) {
+                     forwarded[index], value) < 0 ||
+            strlen(forwarded[index]) + strlen(value) + 2u >
+                sizeof(env_pairs[index])) {
             continue;
         }
         child[at++] = (char *)"--env";
@@ -348,10 +256,14 @@ static int relaunch_in_tab(char **argv, const char *label)
     child[at++] = self;
     /* Copy the original arguments, dropping --tab so the child does not
      * try to open a tab of its own. */
-    for (int index = 1; argv[index] != NULL && at + 2u < KRTSP_ARGV_MAX;
-         ++index) {
+    for (int index = 1; argv[index] != NULL; ++index) {
         if (strcmp(argv[index], "--tab") == 0) {
             continue;
+        }
+        if (at + 1u >= KRTSP_ARGV_MAX) {
+            (void)fprintf(stderr,
+                          "kilix-rtsp: too many arguments to open a tab\n");
+            return -1;
         }
         child[at++] = argv[index];
     }
@@ -371,9 +283,15 @@ static int relaunch_in_tab(char **argv, const char *label)
         execvp("kitty", child);
         _exit(127);
     }
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        return 0;
+    {
+        pid_t waited;
+
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            return 0;
+        }
     }
     (void)fprintf(stderr,
         "kilix-rtsp: could not open a tab; running in this terminal.\n");
@@ -402,7 +320,10 @@ static int command_mosaic(
          * for a wall display. */
         count = krtsp_config_camera_count(config);
         if (count > 16u) {
-            count = 16u;
+            (void)fprintf(stderr,
+                          "kilix-rtsp: mosaic supports at most 16 cameras\n");
+            krtsp_config_free(config);
+            return 2;
         }
         for (size_t index = 0u; index < count; ++index) {
             const krtsp_camera *camera = krtsp_config_camera_at(config, index);
@@ -414,7 +335,14 @@ static int command_mosaic(
                krtsp_config_find_group(config, names[0]) != NULL) {
         const krtsp_group *group = krtsp_config_find_group(config, names[0]);
 
-        count = group->member_count > 16u ? 16u : group->member_count;
+        if (group->member_count > 16u) {
+            (void)fprintf(stderr,
+                          "kilix-rtsp: group '%s' has more than 16 cameras\n",
+                          group->name);
+            krtsp_config_free(config);
+            return 2;
+        }
+        count = group->member_count;
         for (size_t index = 0u; index < count; ++index) {
             const krtsp_camera *camera =
                 krtsp_config_find(config, group->members[index]);
@@ -465,6 +393,18 @@ static int command_view(const char *target, krtsp_tier tier,
     return result;
 }
 
+static bool probe_output_has_video(const char *output)
+{
+    return output != NULL && strstr(output, "codec_type=video") != NULL;
+}
+
+static bool probe_output_is_useful(const char *output)
+{
+    return probe_output_has_video(output) &&
+           strstr(output, "width=0") == NULL &&
+           strstr(output, "pix_fmt=unknown") == NULL;
+}
+
 static int command_probe(const char *target, krtsp_tier tier,
                          const char *config_path)
 {
@@ -500,25 +440,35 @@ static int command_probe(const char *target, krtsp_tier tier,
      * is also what the streaming path uses, so probing over it describes
      * the transport that will actually be used.
      */
-    result = run_ffprobe(escaped, true, output, sizeof(output), 20);
-    if (result != 0) {
+    result = krtsp_run_ffprobe(escaped, true, output, sizeof(output), 20000);
+    if (result != 0 || !probe_output_is_useful(output)) {
         (void)fprintf(stderr,
                       "  (retrying with the default transport)\n");
-        result = run_ffprobe(escaped, false, output, sizeof(output), 15);
+        result = krtsp_run_ffprobe(escaped, false, output, sizeof(output),
+                                   15000);
     }
     /* An exit status of 0 is not proof the probe learned anything. */
-    if (result == 0 && strstr(output, "codec_type=video") != NULL &&
-        strstr(output, "width=0") != NULL) {
+    if (result == 0 && probe_output_has_video(output) &&
+        !probe_output_is_useful(output)) {
         (void)fprintf(stderr,
             "kilix-rtsp: the camera answered but did not describe its video\n"
-            "            stream (width=0).  It may need longer than the\n"
+            "            stream (zero width or unknown pixel format).  It\n"
+            "            may need longer than the\n"
             "            probe allows, or it may only speak a transport this\n"
             "            probe did not use.\n");
         krtsp_config_free(config);
         return 1;
     }
 
-    if (result == -2) {
+    if (result == 0 && output[0] != '\0' &&
+        !probe_output_has_video(output)) {
+        (void)fprintf(stderr,
+                      "kilix-rtsp: probe found no video stream\n");
+        krtsp_config_free(config);
+        return 1;
+    }
+
+    if (result == KRTSP_EXEC_TIMEOUT) {
         (void)fprintf(stderr,
             "kilix-rtsp: probe timed out.  A camera can accept a connection\n"
             "            and then send nothing; that looks identical to a\n"
@@ -545,6 +495,7 @@ int main(int argc, char **argv)
     krtsp_tier tier = KRTSP_TIER_SUB;
     bool tier_given = false;
     bool want_tab = false;
+    bool fps_given = false;
     int fps_cap = 0;
     char *positional[16];
     int positional_count = 0;
@@ -559,9 +510,20 @@ int main(int argc, char **argv)
         usage(stdout);
         return 0;
     }
+    if (strcmp(command, "list") != 0 && strcmp(command, "probe") != 0 &&
+        strcmp(command, "view") != 0 && strcmp(command, "mosaic") != 0) {
+        (void)fprintf(stderr, "kilix-rtsp: unknown command '%s'\n", command);
+        usage(stderr);
+        return 2;
+    }
 
     for (int index = 2; index < argc; ++index) {
-        if (strcmp(argv[index], "--tier") == 0 && index + 1 < argc) {
+        if (strcmp(argv[index], "--tier") == 0) {
+            if (index + 1 >= argc) {
+                (void)fprintf(stderr,
+                              "kilix-rtsp: --tier needs a value\n");
+                return 2;
+            }
             const char *value = argv[++index];
 
             tier_given = true;
@@ -574,16 +536,24 @@ int main(int argc, char **argv)
                               "kilix-rtsp: --tier takes 'main' or 'sub'\n");
                 return 2;
             }
-        } else if (strcmp(argv[index], "--config") == 0 && index + 1 < argc) {
+        } else if (strcmp(argv[index], "--config") == 0) {
+            if (index + 1 >= argc) {
+                (void)fprintf(stderr,
+                              "kilix-rtsp: --config needs a path\n");
+                return 2;
+            }
             config_path = argv[++index];
         } else if (strcmp(argv[index], "--tab") == 0) {
             want_tab = true;
-        } else if (strcmp(argv[index], "--fps") == 0 && index + 1 < argc) {
-            fps_cap = atoi(argv[++index]);
-            if (fps_cap < 0) {
-                (void)fprintf(stderr, "kilix-rtsp: --fps cannot be negative\n");
+        } else if (strcmp(argv[index], "--fps") == 0) {
+            if (index + 1 >= argc ||
+                !parse_nonnegative_int(argv[index + 1], &fps_cap)) {
+                (void)fprintf(stderr,
+                              "kilix-rtsp: --fps needs a non-negative integer\n");
                 return 2;
             }
+            index++;
+            fps_given = true;
         } else if (argv[index][0] == '-') {
             (void)fprintf(stderr, "kilix-rtsp: unknown option %s\n",
                           argv[index]);
@@ -592,20 +562,39 @@ int main(int argc, char **argv)
             if (target == NULL) {
                 target = argv[index];
             }
-            if (positional_count < (int)(sizeof(positional) /
-                                         sizeof(positional[0]))) {
-                positional[positional_count++] = argv[index];
+            if (positional_count >=
+                (int)(sizeof(positional) / sizeof(positional[0]))) {
+                (void)fprintf(stderr,
+                              "kilix-rtsp: at most 16 camera names are allowed\n");
+                return 2;
             }
+            positional[positional_count++] = argv[index];
         }
     }
 
     if (strcmp(command, "list") == 0) {
+        if (positional_count != 0 || tier_given || fps_given || want_tab) {
+            (void)fprintf(stderr,
+                          "kilix-rtsp: list takes only --config\n");
+            return 2;
+        }
         return command_list(config_path);
     }
     if (strcmp(command, "probe") == 0) {
+        if (positional_count != 1 || fps_given || want_tab) {
+            (void)fprintf(stderr,
+                          "kilix-rtsp: probe needs one target; --fps and "
+                          "--tab do not apply\n");
+            return 2;
+        }
         return command_probe(target, tier, config_path);
     }
     if (strcmp(command, "view") == 0) {
+        if (positional_count != 1) {
+            (void)fprintf(stderr,
+                          "kilix-rtsp: view needs exactly one target\n");
+            return 2;
+        }
         /* A view fills the terminal, so it wants the main stream unless
          * told otherwise; presenting an upscaled substream throws away
          * resolution the camera is already producing. */
@@ -639,10 +628,14 @@ int main(int argc, char **argv)
         return command_view(target, tier, config_path, fps_cap);
     }
     if (strcmp(command, "mosaic") == 0) {
+        if (tier_given || want_tab) {
+            (void)fprintf(stderr,
+                          "kilix-rtsp: mosaic uses substreams and does not "
+                          "support --tier or --tab\n");
+            return 2;
+        }
         return command_mosaic(positional, (size_t)positional_count,
                               config_path, fps_cap);
     }
-    (void)fprintf(stderr, "kilix-rtsp: unknown command '%s'\n", command);
-    usage(stderr);
     return 2;
 }

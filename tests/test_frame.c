@@ -1,9 +1,13 @@
 #include "kilix_rtsp.h"
 
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -297,6 +301,7 @@ test_shared_ring_round_trip(void)
     CHECK(krtsp_frame_attach(&reader, name));
     CHECK(reader != NULL);
     CHECK(krtsp_frame_size(reader) == krtsp_frame_size(producer));
+    CHECK(krtsp_frame_back(reader) == NULL);
 
     /* Nothing published yet: a reader must be told so, not handed zeros. */
     CHECK(krtsp_frame_borrow(reader, NULL, NULL) == NULL);
@@ -319,6 +324,229 @@ test_shared_ring_round_trip(void)
     /* The producer owns the object, so attaching after it goes away fails
      * rather than handing back a stale mapping. */
     CHECK(!krtsp_frame_attach(&reader, name));
+    return true;
+}
+
+static bool
+test_live_producer_name_is_not_replaced(void)
+{
+    char name[64];
+    krtsp_frame *producer = NULL;
+    krtsp_frame *collision = NULL;
+    krtsp_frame *reader = NULL;
+
+    ring_name(name, sizeof(name), "live");
+    CHECK(krtsp_frame_init_shared(&producer, name, W, H, 1));
+    CHECK(!krtsp_frame_init_shared(&collision, name, W, H, 1));
+    CHECK(collision == NULL);
+
+    /* The failed second producer must not unlink or replace the first. */
+    CHECK(krtsp_frame_attach(&reader, name));
+    fill(krtsp_frame_back(producer), krtsp_frame_size(producer), 0x39u);
+    krtsp_frame_publish(producer, NULL);
+    CHECK(krtsp_frame_borrow(reader, NULL, NULL) != NULL);
+    krtsp_frame_release(reader);
+
+    krtsp_frame_free(reader);
+    krtsp_frame_free(producer);
+    return true;
+}
+
+static bool
+test_shared_mode_is_exact_under_strict_umask(void)
+{
+    char name[64];
+    krtsp_frame *producer = NULL;
+    krtsp_frame *reader = NULL;
+    struct stat info;
+    mode_t previous;
+    bool initialized;
+    int fd;
+
+    ring_name(name, sizeof(name), "mode");
+    previous = umask(0777);
+    initialized = krtsp_frame_init_shared(&producer, name, W, H, 1);
+    (void)umask(previous);
+    CHECK(initialized);
+
+    fd = shm_open(krtsp_frame_name(producer), O_RDWR | O_CLOEXEC, 0);
+    CHECK(fd >= 0);
+    CHECK(fstat(fd, &info) == 0);
+    CHECK((info.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO)) ==
+          (S_IRUSR | S_IWUSR));
+    CHECK(close(fd) == 0);
+    CHECK(krtsp_frame_attach(&reader, name));
+
+    krtsp_frame_free(reader);
+    krtsp_frame_free(producer);
+    return true;
+}
+
+/* Reader capacity counts active borrowers, even when several hold the same
+ * newest slot.  Counting distinct pinned slots let this case over-commit. */
+static bool
+test_same_frame_borrows_obey_reader_limit(void)
+{
+    char name[64];
+    krtsp_frame *producer = NULL;
+    krtsp_frame *first = NULL;
+    krtsp_frame *second = NULL;
+    krtsp_frame *third = NULL;
+
+    ring_name(name, sizeof(name), "same");
+    CHECK(krtsp_frame_init_shared(&producer, name, W, H, 2));
+    CHECK(krtsp_frame_attach(&first, name));
+    CHECK(krtsp_frame_attach(&second, name));
+    CHECK(krtsp_frame_attach(&third, name));
+    fill(krtsp_frame_back(producer), krtsp_frame_size(producer), 0x61u);
+    krtsp_frame_publish(producer, NULL);
+
+    CHECK(krtsp_frame_borrow(first, NULL, NULL) != NULL);
+    CHECK(krtsp_frame_borrow(second, NULL, NULL) != NULL);
+    CHECK(krtsp_frame_borrow(third, NULL, NULL) == NULL);
+
+    krtsp_frame_release(second);
+    krtsp_frame_release(first);
+    krtsp_frame_free(third);
+    krtsp_frame_free(second);
+    krtsp_frame_free(first);
+    krtsp_frame_free(producer);
+    return true;
+}
+
+static bool
+test_killed_borrower_is_reclaimed(void)
+{
+    char name[64];
+    int ready[2];
+    krtsp_frame *producer = NULL;
+    krtsp_frame *successor = NULL;
+    pid_t child;
+    int status = 0;
+    char byte = '\0';
+
+    ring_name(name, sizeof(name), "dead-reader");
+    CHECK(krtsp_frame_init_shared(&producer, name, W, H, 1));
+    fill(krtsp_frame_back(producer), krtsp_frame_size(producer), 0x72u);
+    krtsp_frame_publish(producer, NULL);
+    CHECK(pipe(ready) == 0);
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        krtsp_frame *reader = NULL;
+        const uint8_t *pixels = NULL;
+
+        (void)close(ready[0]);
+        if (krtsp_frame_attach(&reader, name)) {
+            pixels = krtsp_frame_borrow(reader, NULL, NULL);
+        }
+        if (pixels != NULL && pixels[0] == 0x72u) {
+            (void)write(ready[1], "x", 1u);
+            /* Deliberately skip release/free: the kernel removes mappings,
+             * while the shared lease survives for the producer to reap. */
+            _exit(0);
+        }
+        _exit(1);
+    }
+    (void)close(ready[1]);
+    CHECK(read(ready[0], &byte, 1u) == 1);
+    (void)close(ready[0]);
+    CHECK(byte == 'x');
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    CHECK(krtsp_frame_attach(&successor, name));
+    CHECK(krtsp_frame_borrow(successor, NULL, NULL) != NULL);
+    krtsp_frame_release(successor);
+    krtsp_frame_free(successor);
+    krtsp_frame_free(producer);
+    return true;
+}
+
+static bool
+test_dead_producer_orphan_is_replaced(void)
+{
+    char name[64];
+    int ready[2];
+    krtsp_frame *replacement = NULL;
+    krtsp_frame *reader = NULL;
+    pid_t child;
+    int status = 0;
+    char byte = '\0';
+
+    ring_name(name, sizeof(name), "orphan");
+    CHECK(pipe(ready) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        krtsp_frame *orphan = NULL;
+
+        (void)close(ready[0]);
+        if (krtsp_frame_init_shared(&orphan, name, W, H, 1)) {
+            (void)write(ready[1], "x", 1u);
+            _exit(0); /* simulate a crash: leave the name behind */
+        }
+        _exit(1);
+    }
+    (void)close(ready[1]);
+    CHECK(read(ready[0], &byte, 1u) == 1);
+    (void)close(ready[0]);
+    CHECK(byte == 'x');
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* An orphan cannot produce another frame, so attach rejects it. */
+    CHECK(!krtsp_frame_attach(&reader, name));
+    CHECK(reader == NULL);
+    CHECK(krtsp_frame_init_shared(&replacement, name, W, H, 1));
+    krtsp_frame_free(replacement);
+    return true;
+}
+
+static bool
+test_owner_teardown_preserves_existing_reader(void)
+{
+    char name[64];
+    krtsp_frame *producer = NULL;
+    krtsp_frame *reader = NULL;
+    krtsp_frame *late = NULL;
+    const uint8_t *pixels;
+
+    ring_name(name, sizeof(name), "teardown");
+    CHECK(krtsp_frame_init_shared(&producer, name, W, H, 1));
+    CHECK(krtsp_frame_attach(&reader, name));
+    fill(krtsp_frame_back(producer), krtsp_frame_size(producer), 0x83u);
+    krtsp_frame_publish(producer, NULL);
+    pixels = krtsp_frame_borrow(reader, NULL, NULL);
+    CHECK(pixels != NULL && pixels[0] == 0x83u);
+
+    krtsp_frame_free(producer);
+    CHECK(!krtsp_frame_attach(&late, name));
+    CHECK(pixels[0] == 0x83u);
+    krtsp_frame_release(reader);
+    krtsp_frame_free(reader);
+    return true;
+}
+
+static bool
+test_truncated_shared_object_is_rejected(void)
+{
+    char leaf[64];
+    char name[KRTSP_FRAME_NAME_MAX];
+    krtsp_frame *reader = NULL;
+    int fd;
+
+    ring_name(leaf, sizeof(leaf), "truncated");
+    CHECK(snprintf(name, sizeof(name), "%s%s", KRTSP_FRAME_NAME_PREFIX,
+                   leaf) > 0);
+    fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    CHECK(fd >= 0);
+    CHECK(ftruncate(fd, 1) == 0);
+    CHECK(close(fd) == 0);
+    CHECK(!krtsp_frame_attach(&reader, leaf));
+    CHECK(reader == NULL);
+    CHECK(shm_unlink(name) == 0);
     return true;
 }
 
@@ -468,6 +696,7 @@ test_shared_ring_rejections(void)
     CHECK(!krtsp_frame_init_shared(&frame, "", W, H, 1));
     CHECK(!krtsp_frame_init_shared(&frame, name, 0, H, 1));
     CHECK(!krtsp_frame_init_shared(&frame, name, W, -1, 1));
+    CHECK(!krtsp_frame_init_shared(&frame, name, W, H, INT_MAX));
     /* a leaf, not a path: these would escape the namespace */
     CHECK(!krtsp_frame_init_shared(&frame, "has/slash", W, H, 1));
     CHECK(!krtsp_frame_init_shared(&frame, "has space", W, H, 1));
@@ -502,6 +731,19 @@ main(void)
         {"concurrent publish and borrow", test_concurrent_publish_and_borrow},
         {"rejections", test_rejections},
         {"shared ring round trip", test_shared_ring_round_trip},
+        {"live producer name is not replaced",
+         test_live_producer_name_is_not_replaced},
+        {"shared mode is exact under strict umask",
+         test_shared_mode_is_exact_under_strict_umask},
+        {"same frame borrows obey reader limit",
+         test_same_frame_borrows_obey_reader_limit},
+        {"killed borrower is reclaimed", test_killed_borrower_is_reclaimed},
+        {"dead producer orphan is replaced",
+         test_dead_producer_orphan_is_replaced},
+        {"owner teardown preserves existing reader",
+         test_owner_teardown_preserves_existing_reader},
+        {"truncated shared object is rejected",
+         test_truncated_shared_object_is_rejected},
         {"shared ring crosses a process",
          test_shared_ring_crosses_a_process},
         {"shared ring reserves a slot for the producer",

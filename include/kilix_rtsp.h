@@ -13,8 +13,9 @@
  * makes a fixed pixel format the pipe's framing: read exactly
  * width * height * 4 bytes and you have exactly one frame.
  *
- * The library is acquisition and presentation only.  Recording, retention
- * and object detection belong to whatever consumes it.
+ * The library owns acquisition and optional packet-copy recording.  The
+ * command adds terminal presentation.  Retention policy and object detection
+ * belong to whatever consumes it.
  */
 
 #include <stdbool.h>
@@ -273,8 +274,8 @@ bool krtsp_frame_init(krtsp_frame **frame, int width, int height);
  *
  * `name` is a leaf, not a path: it is prefixed to form the object name,
  * and must not contain '/', a backslash, or whitespace.  One producer
- * owns a given name; creating over an existing object treats it as a leak
- * from a dead run and replaces it.
+ * owns a given name.  A second live producer is refused; an object whose
+ * producer died is recognized by its released lifetime lock and replaced.
  *
  * `max_readers` is how many consumers may hold a borrow *at the same
  * time*, not how many may attach - readers that borrow and release
@@ -282,16 +283,22 @@ bool krtsp_frame_init(krtsp_frame **frame, int width, int height);
  * max_readers + 2, and krtsp_frame_borrow() refuses beyond it rather than
  * overwriting a slot somebody is reading.
  *
- * Frames are not authenticated.  Anything able to open the object can
- * read the camera's pixels, so the object is created 0600 and the same
- * reasoning that keeps camera URLs out of world-readable files applies.
+ * Borrowers have process leases, so a reader killed before release does not
+ * permanently consume capacity.  The process-shared mutex is robust on
+ * Linux and repairs its derived pin state if a holder dies mid-update.
+ *
+ * Frames are not authenticated.  Anything able to open the object can read
+ * the camera's pixels, so the object is forced to exact mode 0600 even under
+ * a stricter umask, and the same reasoning that keeps camera URLs out of
+ * world-readable files applies.
  */
 bool krtsp_frame_init_shared(krtsp_frame **frame, const char *name,
                              int width, int height, int max_readers);
 
 /*
  * Attach to a ring some other process created.  Fails when the object is
- * missing, was built by an incompatible version, or is not a ring at all.
+ * missing, its producer is no longer alive, its owner/mode/size is unsafe,
+ * it was built by an incompatible version, or it is not a ring at all.
  *
  * A reader gets the same borrow/release contract as an in-process
  * consumer.  It never unlinks the object: the producer owns that.
@@ -548,10 +555,12 @@ typedef struct krtsp_config krtsp_config;
  * Load camera definitions.  `path` NULL reads
  * <state dir>/config/cameras.conf.
  *
- * The file holds passwords, so it is required to be a regular file owned
- * by the caller with no group or world permission bits.  A readable-by-
- * others credential file is refused rather than warned about: the whole
- * point of keeping it outside the repository is that it is a secret.
+ * The file holds passwords, so it is required to be a regular, non-symlink
+ * file owned by the caller with no group or world permission bits.  The
+ * opened descriptor itself is checked, so a path replacement cannot swap a
+ * different file in after validation.  A readable-by-others credential file
+ * is refused rather than warned about: the whole point of keeping it outside
+ * the repository is that it is a secret.
  *
  * On failure `error` receives a message that never contains a URL.
  */

@@ -369,6 +369,17 @@ test_password_escaping(void)
                                     sizeof(out)));
     CHECK(strcmp(out, "rtsp://u:a%20b@203.0.113.9/1") == 0);
 
+    /* Configuration must percent-encode '/', '?' and '#'.  Preserve valid
+     * triplets: encoding '%' again silently changes the actual password. */
+    CHECK(krtsp_url_escape_password(
+        "rtsp://u:a%2Fb%3Fc%23d@203.0.113.9/1", out, sizeof(out)));
+    CHECK(strcmp(out,
+                 "rtsp://u:a%2Fb%3Fc%23d@203.0.113.9/1") == 0);
+    /* A malformed triplet is a literal percent and must still be escaped. */
+    CHECK(krtsp_url_escape_password("rtsp://u:a%2G@203.0.113.9/1", out,
+                                    sizeof(out)));
+    CHECK(strcmp(out, "rtsp://u:a%252G@203.0.113.9/1") == 0);
+
     /* Nothing to do when there is no password, or no userinfo at all. */
     CHECK(krtsp_url_escape_password("rtsp://admin@203.0.113.9/1", out,
                                     sizeof(out)));

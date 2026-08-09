@@ -7,11 +7,12 @@
  *
  * Two decisions worth stating:
  *
- * Frames are requested as BGRA.  soft-raster's canvas is uint32
- * 0xAARRGGBB, which on a little-endian machine is the byte order B,G,R,A,
- * so a BGRA frame can be wrapped as a canvas with no conversion.
- * sr_pack_rgba() then produces the R,G,B,A order kittyts_present() wants.
- * Asking for RGBA instead and wrapping it would swap red and blue.
+ * A healthy fullscreen source is requested as RGBA and passed straight to
+ * kittyts_present(), which copies it before returning.  No intermediate
+ * full-frame conversion is needed on the path that runs almost all the time.
+ * Only a degraded frame needs a private soft-raster canvas for its banner;
+ * that rare path converts RGBA to 0xAARRGGBB, draws, then packs back to RGBA.
+ * Mosaic tiles remain BGRA because every composite draws captions.
  *
  * The loop presents only when the frame sequence changes.  These cameras
  * deliver 8-20 fps; presenting the same frame at 60 would spend the whole
@@ -21,6 +22,7 @@
 #include "kilix_rtsp.h"
 #include "krtsp_view.h"
 #include "krtsp_attach.h"
+#include "krtsp_source_internal.h"
 
 #include "kitty_terminal_session.h"
 #include "soft_raster.h"
@@ -72,6 +74,29 @@ static void sleep_ms(int milliseconds)
     pause.tv_sec = milliseconds / 1000;
     pause.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
     (void)nanosleep(&pause, NULL);
+}
+
+static bool rgba_size(int width, int height, size_t *bytes)
+{
+    if (bytes == NULL || width <= 0 || height <= 0 ||
+        (size_t)width > SIZE_MAX / 4u / (size_t)height) {
+        return false;
+    }
+    *bytes = (size_t)width * (size_t)height * 4u;
+    return true;
+}
+
+static void copy_rgba_to_canvas(uint32_t *canvas, const uint8_t *rgba,
+                                size_t pixels)
+{
+    for (size_t index = 0u; index < pixels; ++index) {
+        size_t at = index * 4u;
+
+        canvas[index] = (uint32_t)rgba[at + 3u] << 24 |
+                        (uint32_t)rgba[at] << 16 |
+                        (uint32_t)rgba[at + 1u] << 8 |
+                        (uint32_t)rgba[at + 2u];
+    }
 }
 
 /*
@@ -137,6 +162,7 @@ static bool start_terminal(kittyts_session *session)
 {
     kittyts_options options;
 
+    g_quit = 0;
     kittyts_options_init(&options);
     kittyts_session_init(session);
     /* AUTO picks shared memory when it can, which is what makes a
@@ -200,9 +226,11 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     uint8_t *present_buffer = NULL;
     uint64_t last_sequence = UINT64_MAX;
     long long resize_pending_at = 0;
+    long long status_presented_at = 0;
     int width;
     int height;
     int exit_code = 0;
+    size_t present_size;
 
     if (url == NULL || label == NULL) {
         return 2;
@@ -214,6 +242,11 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
 
     width = kittyts_width(&session);
     height = kittyts_height(&session);
+    if (!rgba_size(width, height, &present_size)) {
+        kittyts_stop(&session);
+        g_session = NULL;
+        return 1;
+    }
     krtsp_attach_init(&attach);
 
     krtsp_source_options_init(&source_options);
@@ -223,7 +256,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     /* ffmpeg letterboxes, so every frame is exactly framebuffer-sized and
      * the loop never scales. */
     source_options.letterbox = true;
-    source_options.pixfmt = KRTSP_PIXFMT_BGRA;
+    source_options.pixfmt = KRTSP_PIXFMT_RGBA;
 
     if (!krtsp_source_start(&source, url, &source_options)) {
         kittyts_stop(&session);
@@ -232,7 +265,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
         return 1;
     }
 
-    present_buffer = malloc((size_t)width * (size_t)height * 4u);
+    present_buffer = malloc(present_size);
     if (present_buffer == NULL) {
         krtsp_source_stop(source);
         kittyts_stop(&session);
@@ -247,6 +280,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
         const uint8_t *pixels;
         krtsp_status status;
         char banner[192];
+        uint64_t sequence = 0u;
 
         /*
          * Stop decoding while nobody is looking.
@@ -301,12 +335,16 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
             new_width = kittyts_width(&session);
             new_height = kittyts_height(&session);
             if (new_width != width || new_height != height) {
-                uint8_t *grown =
-                    realloc(present_buffer,
-                            (size_t)new_width * (size_t)new_height * 4u);
+                size_t new_size;
+                uint8_t *grown = NULL;
+
+                if (rgba_size(new_width, new_height, &new_size)) {
+                    grown = realloc(present_buffer, new_size);
+                }
 
                 if (grown != NULL) {
                     present_buffer = grown;
+                    present_size = new_size;
                     width = new_width;
                     height = new_height;
                     krtsp_source_stop(source);
@@ -328,7 +366,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
         }
 
         status = krtsp_source_status(source);
-        pixels = krtsp_source_borrow(source, &age_ms);
+        pixels = krtsp_source_borrow_latest(source, &sequence, &age_ms);
 
         if (pixels == NULL) {
             /* Nothing yet.  Say what is happening rather than showing a
@@ -340,15 +378,16 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                            status == KRTSP_STARTING ? "connecting"
                                                     : krtsp_status_name(status));
             draw_centered_notice(&canvas, banner);
-            (void)sr_pack_rgba(&canvas, present_buffer,
-                               (size_t)width * (size_t)height * 4u);
-            (void)kittyts_present(&session, present_buffer, width, height);
+            (void)sr_pack_rgba(&canvas, present_buffer, present_size);
+            if (!kittyts_present(&session, present_buffer, width, height)) {
+                exit_code = 1;
+                break;
+            }
             sleep_ms(200);
             continue;
         }
 
         {
-            krtsp_source_stats stats;
             bool degraded = status != KRTSP_ONLINE || age_ms > 2000;
             bool changed;
 
@@ -363,20 +402,25 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
              * live age, so it has to be redrawn even when the picture
              * behind it is frozen.
              */
-            krtsp_source_get_stats(source, &stats);
-            changed = stats.frames != last_sequence;
+            changed = sequence != last_sequence;
             if (!changed && !degraded) {
                 krtsp_source_release(source);
                 sleep_ms(8);
                 continue;
             }
-            last_sequence = stats.frames;
+            if (!changed && degraded &&
+                monotonic_ms() - status_presented_at < 250) {
+                krtsp_source_release(source);
+                sleep_ms(8);
+                continue;
+            }
+            last_sequence = sequence;
 
             if (degraded) {
                 /* Drawing over the frame needs a private copy: the
                  * borrowed buffer belongs to the source. */
-                memcpy(present_buffer, pixels,
-                       (size_t)width * (size_t)height * 4u);
+                copy_rgba_to_canvas((uint32_t *)(void *)present_buffer, pixels,
+                                    present_size / 4u);
                 krtsp_source_release(source);
                 sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
                                width, height);
@@ -384,19 +428,19 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                                label, krtsp_status_name(status),
                                (double)age_ms / 1000.0);
                 draw_banner(&canvas, banner, status_accent(status));
-                (void)sr_pack_rgba(&canvas, present_buffer,
-                                   (size_t)width * (size_t)height * 4u);
+                (void)sr_pack_rgba(&canvas, present_buffer, present_size);
+                status_presented_at = monotonic_ms();
             } else {
-                /* Nothing is drawn over a healthy frame, so pack straight
-                 * out of the borrowed buffer.  sr_pack_rgba() takes a
-                 * const canvas and writes elsewhere, so this skips a
-                 * full-frame copy - 7.7 MB per frame at full screen - in
-                 * the case that runs essentially all the time. */
-                sr_canvas_wrap(&canvas, (uint32_t *)(void *)(uintptr_t)pixels,
-                               width, height);
-                (void)sr_pack_rgba(&canvas, present_buffer,
-                                   (size_t)width * (size_t)height * 4u);
+                bool presented =
+                    kittyts_present(&session, pixels, width, height);
+
                 krtsp_source_release(source);
+                if (!presented) {
+                    exit_code = 1;
+                    break;
+                }
+                sleep_ms(8);
+                continue;
             }
             if (!kittyts_present(&session, present_buffer, width, height)) {
                 exit_code = 1;
@@ -426,6 +470,7 @@ typedef struct mosaic_slot {
     krtsp_tile tile;
     const char *label;
     uint64_t last_frames;
+    krtsp_status last_status;
 } mosaic_slot;
 
 /* Start one source per tile, each decoding straight to its tile size.
@@ -477,10 +522,16 @@ int krtsp_mosaic_run(
     int width;
     int height;
     int exit_code = 0;
+    size_t present_size;
 
     if (urls == NULL || labels == NULL || count == 0u ||
         count > KRTSP_MOSAIC_MAX) {
         return 2;
+    }
+    for (size_t index = 0u; index < count; ++index) {
+        if (urls[index] == NULL || labels[index] == NULL) {
+            return 2;
+        }
     }
     (void)memset(slots, 0, sizeof(slots));
 
@@ -490,6 +541,11 @@ int krtsp_mosaic_run(
 
     width = kittyts_width(&session);
     height = kittyts_height(&session);
+    if (!rgba_size(width, height, &present_size)) {
+        kittyts_stop(&session);
+        g_session = NULL;
+        return 1;
+    }
     krtsp_attach_init(&attach);
 
     if (krtsp_mosaic_layout(width, height, count, 16.0f / 9.0f, tiles,
@@ -504,7 +560,7 @@ int krtsp_mosaic_run(
         slots[index].tile = tiles[index];
         slots[index].label = labels[index];
     }
-    present_buffer = malloc((size_t)width * (size_t)height * 4u);
+    present_buffer = malloc(present_size);
     if (present_buffer == NULL || !mosaic_start_sources(slots, count, urls,
                                                         fps_cap)) {
         mosaic_stop_sources(slots, count);
@@ -549,15 +605,18 @@ int krtsp_mosaic_run(
             new_width = kittyts_width(&session);
             new_height = kittyts_height(&session);
             if (new_width != width || new_height != height) {
-                uint8_t *grown = realloc(
-                    present_buffer,
-                    (size_t)new_width * (size_t)new_height * 4u);
-
-                if (grown != NULL &&
+                size_t new_size;
+                bool layout_ok =
+                    rgba_size(new_width, new_height, &new_size) &&
                     krtsp_mosaic_layout(new_width, new_height, count,
                                         16.0f / 9.0f, tiles,
-                                        KRTSP_MOSAIC_MAX) == count) {
+                                        KRTSP_MOSAIC_MAX) == count;
+                uint8_t *grown =
+                    layout_ok ? realloc(present_buffer, new_size) : NULL;
+
+                if (grown != NULL) {
                     present_buffer = grown;
+                    present_size = new_size;
                     width = new_width;
                     height = new_height;
                     mosaic_stop_sources(slots, count);
@@ -588,12 +647,23 @@ int krtsp_mosaic_run(
          * most twenty visibly different frames.  The cap turns most of
          * that into one composite carrying several tiles' updates.
          */
-        for (size_t index = 0u; index < count; ++index) {
-            krtsp_source_stats stats;
+        {
+            long long now = monotonic_ms();
 
-            krtsp_source_get_stats(slots[index].source, &stats);
-            if (stats.frames != slots[index].last_frames) {
-                any_new = true;
+            for (size_t index = 0u; index < count; ++index) {
+                uint64_t frames =
+                    krtsp_source_frame_count(slots[index].source);
+                krtsp_status status =
+                    krtsp_source_status(slots[index].source);
+                int age_ms =
+                    krtsp_source_frame_age_ms(slots[index].source);
+                bool degraded = status != KRTSP_ONLINE || age_ms > 2000;
+
+                if (frames != slots[index].last_frames ||
+                    status != slots[index].last_status ||
+                    (degraded && now - composed_at >= 1000)) {
+                    any_new = true;
+                }
             }
         }
         if (!any_new ||
@@ -609,16 +679,14 @@ int krtsp_mosaic_run(
 
         for (size_t index = 0u; index < count; ++index) {
             const krtsp_tile *tile = &slots[index].tile;
-            krtsp_source_stats stats;
             krtsp_status status = krtsp_source_status(slots[index].source);
             const uint8_t *pixels;
             int age_ms = 0;
             char caption[128];
+            uint64_t sequence = 0u;
 
-            krtsp_source_get_stats(slots[index].source, &stats);
-            slots[index].last_frames = stats.frames;
-
-            pixels = krtsp_source_borrow(slots[index].source, &age_ms);
+            pixels = krtsp_source_borrow_latest(
+                slots[index].source, &sequence, &age_ms);
             if (pixels != NULL) {
                 sr_canvas source_canvas;
 
@@ -627,11 +695,14 @@ int krtsp_mosaic_run(
                                tile->width, tile->height);
                 sr_blit(&canvas, &source_canvas, tile->x, tile->y);
                 krtsp_source_release(slots[index].source);
+                slots[index].last_frames = sequence;
             } else {
                 sr_fill_rect(&canvas, (float)tile->x, (float)tile->y,
                              (float)tile->width, (float)tile->height,
                              0x141418u, 1.0f);
+                slots[index].last_frames = 0u;
             }
+            slots[index].last_status = status;
 
             /* Every tile is captioned.  In a grid, "which camera is
              * that" is the first question, and an unlabelled tile that
@@ -668,8 +739,7 @@ int krtsp_mosaic_run(
             }
         }
 
-        (void)sr_pack_rgba(&canvas, present_buffer,
-                           (size_t)width * (size_t)height * 4u);
+        (void)sr_pack_rgba(&canvas, present_buffer, present_size);
         if (!kittyts_present(&session, present_buffer, width, height)) {
             exit_code = 1;
             break;
