@@ -120,6 +120,18 @@ typedef struct krtsp_args_request {
      * krtsp_source probes the binary once and sets this. */
     bool legacy_timeout_flag;
 
+    /*
+     * Pace a local input at its own frame rate (-re).  Ignored for RTSP,
+     * which is already paced by the camera.  Default true.
+     *
+     * A recording read as fast as the disk allows is not a stand-in for a
+     * camera: it fills the ring in a second and every consumer sees only
+     * the end of it.  Set false when the point is to get through the file
+     * quickly - scanning footage for what is in it rather than watching
+     * it.
+     */
+    bool realtime;
+
     /* Bitmask of krtsp_role.  Zero means KRTSP_ROLE_DECODE, which is what
      * every caller predating the record sink asked for. */
     unsigned roles;

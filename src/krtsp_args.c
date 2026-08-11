@@ -48,6 +48,8 @@ void krtsp_args_request_init(krtsp_args_request *request)
     request->height = 0;
     request->fps_cap = 0;
     request->low_latency = true;
+    /* A local file behaves like a camera unless told otherwise. */
+    request->realtime = true;
     request->letterbox = false;
     request->pixfmt = KRTSP_PIXFMT_RGBA;
     request->legacy_timeout_flag = false;
@@ -124,6 +126,7 @@ size_t krtsp_build_argv(
 {
     arg_writer writer;
     bool scaling;
+    bool network_input;
     unsigned roles;
 
     if (request == NULL || argv == NULL || storage == NULL ||
@@ -172,6 +175,15 @@ size_t krtsp_build_argv(
     writer.storage_used = 0u;
     writer.failed = false;
 
+    /* An RTSP url is the common case and the only one that takes RTSP
+     * options.  rtsps:// too, and http(s):// carries a user agent but no
+     * transport or socket timeout - everything else is local. */
+    {
+        const char *url = request->url != NULL ? request->url : "";
+
+        network_input = strncmp(url, "rtsp://", 7) == 0 ||
+                        strncmp(url, "rtsps://", 8) == 0;
+    }
     push_arg(&writer, "ffmpeg");
 
     /* Global. */
@@ -184,15 +196,38 @@ size_t krtsp_build_argv(
     push_arg(&writer, "-nostdin");
 
     /* Input. */
-    push_arg(&writer, "-user_agent");
-    push_format(&writer, "kilix-rtsp/%d.%d.%d",
-                KILIX_RTSP_VERSION_MAJOR,
-                KILIX_RTSP_VERSION_MINOR,
-                KILIX_RTSP_VERSION_PATCH);
-    push_arg(&writer, "-rtsp_transport");
-    push_arg(&writer, "tcp");
-    push_arg(&writer, request->legacy_timeout_flag ? "-stimeout" : "-timeout");
-    push_arg(&writer, "10000000");
+    if (network_input) {
+        /*
+         * RTSP options go to RTSP inputs only.
+         *
+         * ffmpeg refuses a demuxer option the demuxer does not have -
+         * "Option rtsp_transport not found", exit 1 - so passing these
+         * unconditionally means a local file or a capture device can
+         * never be a source.  That is not a hypothetical: a recording
+         * standing in for a camera is how the pipelines above this get
+         * tested without hardware, and how a person auditions a model
+         * against footage they already have.
+         */
+        push_arg(&writer, "-user_agent");
+        push_format(&writer, "kilix-rtsp/%d.%d.%d",
+                    KILIX_RTSP_VERSION_MAJOR,
+                    KILIX_RTSP_VERSION_MINOR,
+                    KILIX_RTSP_VERSION_PATCH);
+        push_arg(&writer, "-rtsp_transport");
+        push_arg(&writer, "tcp");
+        push_arg(&writer,
+                 request->legacy_timeout_flag ? "-stimeout" : "-timeout");
+        push_arg(&writer, "10000000");
+    } else if (request->realtime) {
+        /*
+         * A file read as fast as the disk allows is not a camera: it
+         * fills the ring in a second and every consumer sees the end of
+         * the recording.  -re paces it at its own frame rate, which is
+         * what makes "point this at a recording" behave like pointing it
+         * at the thing that recorded it.
+         */
+        push_arg(&writer, "-re");
+    }
     push_arg(&writer, "-avoid_negative_ts");
     push_arg(&writer, "make_zero");
     push_arg(&writer, "-fflags");
