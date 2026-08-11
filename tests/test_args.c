@@ -142,6 +142,35 @@ test_a_local_file_is_not_given_rtsp_options(void)
     CHECK(count > 0u);
     CHECK(!has_arg(count, "-re"));
 
+    /* Seeking into a recording: before -i, and pacing still applies. */
+    krtsp_args_request_init(&request);
+    request.url = "/srv/footage/yesterday.mkv";
+    request.seek_seconds = 900;
+    count = krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
+                             sizeof(storage));
+    CHECK(has_pair(count, "-ss", "900"));
+    CHECK(has_arg(count, "-re"));
+    {
+        /* Before the input, or ffmpeg decodes everything up to the offset
+         * and throws it away - nine hours of work for a nine-hour-old
+         * moment. */
+        size_t seek = 0u;
+        size_t input = 0u;
+
+        for (size_t i = 0u; i < count; i++) {
+            if (strcmp(argv[i], "-ss") == 0) { seek = i; }
+            if (strcmp(argv[i], "-i") == 0) { input = i; }
+        }
+        CHECK(seek > 0u && input > 0u && seek < input);
+    }
+    /* A camera has no beginning to seek from. */
+    krtsp_args_request_init(&request);
+    request.url = "rtsp://camera.example/stream";
+    request.seek_seconds = 900;
+    count = krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
+                             sizeof(storage));
+    CHECK(!has_arg(count, "-ss"));
+
     /* rtsps is still a camera. */
     krtsp_args_request_init(&request);
     request.url = "rtsps://camera.example/stream";

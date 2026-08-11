@@ -218,6 +218,15 @@ size_t krtsp_build_argv(
         push_arg(&writer,
                  request->legacy_timeout_flag ? "-stimeout" : "-timeout");
         push_arg(&writer, "10000000");
+    } else if (request->seek_seconds > 0) {
+        /* Before -i on purpose: after it, ffmpeg decodes and throws away
+         * everything up to the offset, which for a nine-hour-old moment
+         * is nine hours of work nobody wanted. */
+        push_arg(&writer, "-ss");
+        push_format(&writer, "%d", request->seek_seconds);
+        if (request->realtime) {
+            push_arg(&writer, "-re");
+        }
     } else if (request->realtime) {
         /*
          * A file read as fast as the disk allows is not a camera: it

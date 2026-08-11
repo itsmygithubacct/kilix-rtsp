@@ -131,6 +131,18 @@ typedef struct krtsp_args_request {
      * it.
      */
     bool realtime;
+    /*
+     * Start this many seconds into a local input.  Ignored for RTSP,
+     * which has no beginning to be an offset from.
+     *
+     * Placed before -i, so ffmpeg seeks by keyframe rather than decoding
+     * and discarding: that is the difference between opening a recording
+     * at nine in the morning instantly and waiting for nine hours of
+     * frames.  The first frame is then the keyframe at or before the
+     * offset rather than the exact one, which is right for playback and
+     * wrong for anything counting frames.
+     */
+    int seek_seconds;
 
     /* Bitmask of krtsp_role.  Zero means KRTSP_ROLE_DECODE, which is what
      * every caller predating the record sink asked for. */
@@ -392,6 +404,18 @@ typedef struct krtsp_source_options {
      * Default true, so a recording stands in for a camera; false to get
      * through a file as fast as it will decode. */
     bool realtime;
+    /*
+     * Start this many seconds into a local input.  Ignored for RTSP,
+     * which has no beginning to be an offset from.
+     *
+     * Placed before -i, so ffmpeg seeks by keyframe rather than decoding
+     * and discarding: that is the difference between opening a recording
+     * at nine in the morning instantly and waiting for nine hours of
+     * frames.  The first frame is then the keyframe at or before the
+     * offset rather than the exact one, which is right for playback and
+     * wrong for anything counting frames.
+     */
+    int seek_seconds;
 
     /* Scale-to-fit and pad, so frames arrive at exactly width x height
      * whatever the camera's aspect ratio is.  See krtsp_args_request. */
