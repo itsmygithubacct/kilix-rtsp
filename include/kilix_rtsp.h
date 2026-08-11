@@ -364,6 +364,21 @@ const uint8_t *krtsp_frame_borrow(
     krtsp_frame *frame, uint64_t *sequence, int *age_ms);
 void krtsp_frame_release(krtsp_frame *frame);
 
+/*
+ * How many live processes are attached to a shared ring.
+ *
+ * Attachment, not borrowing: a borrow lasts microseconds, so counting
+ * those answers "is anyone reading this instant", which is almost always
+ * no even with a viewer on screen.  This is what lets a producer decide
+ * whether anything is watching - a recorder running a model only while
+ * somebody is looking needs exactly this question answered.
+ *
+ * A reader killed without unmapping is swept here by liveness, so a
+ * viewer that crashes does not leave a camera detecting for ever.  Zero
+ * for a private ring, which by definition has no other process.
+ */
+size_t krtsp_frame_readers(const krtsp_frame *frame);
+
 /* Total frames published and frames replaced before being taken. */
 void krtsp_frame_stats(
     const krtsp_frame *frame, uint64_t *published, uint64_t *dropped);

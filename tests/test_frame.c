@@ -720,6 +720,52 @@ typedef struct test_case {
     test_function function;
 } test_case;
 
+/*
+ * Who is attached, which is a different question from who is borrowing.
+ *
+ * A producer that runs a model only while something is watching asks this
+ * one, and asking the borrow count instead would answer "nobody" almost
+ * always - a borrow lasts microseconds.
+ */
+static bool test_readers_are_counted_by_attachment(void)
+{
+    char name[64];
+    krtsp_frame *producer = NULL;
+    krtsp_frame *first = NULL;
+    krtsp_frame *second = NULL;
+    krtsp_frame *private_ring = NULL;
+
+    ring_name(name, sizeof(name), "rd");
+    CHECK(krtsp_frame_init_shared(&producer, name, W, H, 3));
+    /* The producer is not a reader of its own ring. */
+    CHECK(krtsp_frame_readers(producer) == 0u);
+
+    CHECK(krtsp_frame_attach(&first, name));
+    CHECK(krtsp_frame_readers(producer) == 1u);
+    /* Counted while nothing is borrowed, which is the whole point. */
+    CHECK(krtsp_frame_borrow(first, NULL, NULL) == NULL);
+    CHECK(krtsp_frame_readers(producer) == 1u);
+
+    CHECK(krtsp_frame_attach(&second, name));
+    CHECK(krtsp_frame_readers(producer) == 2u);
+    /* A reader sees the same count as the producer. */
+    CHECK(krtsp_frame_readers(first) == 2u);
+
+    krtsp_frame_free(second);
+    CHECK(krtsp_frame_readers(producer) == 1u);
+    krtsp_frame_free(first);
+    CHECK(krtsp_frame_readers(producer) == 0u);
+
+    krtsp_frame_free(producer);
+
+    /* A private ring has no other process by construction. */
+    CHECK(krtsp_frame_init(&private_ring, W, H));
+    CHECK(krtsp_frame_readers(private_ring) == 0u);
+    krtsp_frame_free(private_ring);
+    CHECK(krtsp_frame_readers(NULL) == 0u);
+    return true;
+}
+
 int
 main(void)
 {
@@ -750,7 +796,9 @@ main(void)
          test_shared_ring_reserves_a_slot_for_the_producer},
         {"shared ring borrow survives publishes",
          test_shared_ring_borrow_survives_publishes},
-        {"shared ring rejections", test_shared_ring_rejections}
+        {"shared ring rejections", test_shared_ring_rejections},
+        {"readers are counted by attachment",
+         test_readers_are_counted_by_attachment}
     };
     size_t passed = 0u;
 

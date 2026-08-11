@@ -54,7 +54,7 @@
 #include <unistd.h>
 
 #define RING_MAGIC 0x4b525450u   /* 'KRTP' */
-#define RING_VERSION 2u
+#define RING_VERSION 3u
 #define RING_MAX_SLOTS 32
 #define RING_MAX_READERS (RING_MAX_SLOTS - 2)
 #define RING_ALIGN 64u
@@ -85,12 +85,24 @@ struct ring_header {
     int32_t pin[RING_MAX_SLOTS];
     int64_t borrower_pid[RING_MAX_READERS];
     int32_t borrower_slot[RING_MAX_READERS];
+    /*
+     * Who is attached, as opposed to who is mid-borrow.
+     *
+     * A borrow lasts microseconds, so counting borrows answers "is anyone
+     * reading right this instant" - which is almost always no, even with
+     * a viewer on screen.  A producer that wants to know whether anything
+     * is watching, so it can decide whether to run a model at all, needs
+     * attachment instead, and that is this.  Reclaimed by liveness like
+     * the borrow leases, since a reader killed with -9 unmaps nothing.
+     */
+    int64_t reader_pid[RING_MAX_READERS];
 
     pthread_mutex_t lock;
 };
 
 struct krtsp_frame {
     struct ring_header *header;
+    int reader;                 /* shared reader entry, -1 = none */
     uint8_t *slots;             /* slots[i] at slots + i * frame_size */
     size_t map_size;
     bool shared;
@@ -636,6 +648,21 @@ bool krtsp_frame_attach(krtsp_frame **out, const char *name)
                      frame->header->height == probe.height &&
                      frame->header->slots == probe.slots;
 
+        if (valid) {
+            /* Claimed here, while the header is already locked and
+             * already known good. */
+            frame->reader = -1;
+            for (int i = 0; i < frame->header->slots - 2; i++) {
+                if (frame->header->reader_pid[i] > 0 &&
+                    !pid_is_alive(frame->header->reader_pid[i])) {
+                    frame->header->reader_pid[i] = 0;
+                }
+                if (frame->header->reader_pid[i] == 0 && frame->reader < 0) {
+                    frame->header->reader_pid[i] = (int64_t)getpid();
+                    frame->reader = i;
+                }
+            }
+        }
         ring_unlock(frame->header);
         if (!valid) {
             (void)munmap(mapping, map_size);
@@ -668,6 +695,17 @@ void krtsp_frame_free(krtsp_frame *frame)
         return;
     }
     krtsp_frame_release(frame);
+    if (frame->shared && frame->reader >= 0 && frame->header != NULL) {
+        if (ring_lock(frame->header)) {
+            if (frame->reader < frame->header->slots - 2 &&
+                frame->header->reader_pid[frame->reader] ==
+                    (int64_t)getpid()) {
+                frame->header->reader_pid[frame->reader] = 0;
+            }
+            ring_unlock(frame->header);
+        }
+        frame->reader = -1;
+    }
     if (frame->shared) {
         if (frame->owns) {
             /* Unlink while the lifetime lock is still held.  Existing
@@ -684,6 +722,35 @@ void krtsp_frame_free(krtsp_frame *frame)
         free(frame->header);
     }
     free(frame);
+}
+
+size_t krtsp_frame_readers(const krtsp_frame *frame)
+{
+    struct krtsp_frame *mutable_frame = (struct krtsp_frame *)frame;
+    size_t total = 0u;
+
+    if (frame == NULL || !frame->shared || frame->header == NULL) {
+        return 0u;
+    }
+    if (!ring_lock(mutable_frame->header)) {
+        return 0u;
+    }
+    for (int i = 0; i < frame->header->slots - 2; i++) {
+        const int64_t pid = frame->header->reader_pid[i];
+
+        if (pid <= 0) {
+            continue;
+        }
+        /* Counted and swept in one pass: a reader that died holding a
+         * slot must not keep a camera's detector running for ever. */
+        if (!pid_is_alive(pid)) {
+            mutable_frame->header->reader_pid[i] = 0;
+            continue;
+        }
+        total++;
+    }
+    ring_unlock(mutable_frame->header);
+    return total;
 }
 
 uint8_t *krtsp_frame_back(krtsp_frame *frame)
