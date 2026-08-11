@@ -105,6 +105,53 @@ test_defaults(void)
     return true;
 }
 
+/*
+ * A local input is not a camera and must not be handed camera options.
+ *
+ * ffmpeg exits 1 on a demuxer option the demuxer does not have, so the
+ * unconditional -rtsp_transport meant a file could never be a source -
+ * and a recording standing in for a camera is how everything built on
+ * this gets tested without hardware.
+ */
+static bool
+test_a_local_file_is_not_given_rtsp_options(void)
+{
+    krtsp_args_request request;
+    size_t count;
+
+    krtsp_args_request_init(&request);
+    request.url = "/srv/footage/yesterday.mkv";
+    count = krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
+                             sizeof(storage));
+    CHECK(count > 0u);
+    CHECK(!has_arg(count, "-rtsp_transport"));
+    CHECK(!has_arg(count, "-timeout"));
+    CHECK(!has_arg(count, "-stimeout"));
+    CHECK(!has_arg(count, "-user_agent"));
+    /* Paced by default, so the ring sees it at the rate it was shot. */
+    CHECK(has_arg(count, "-re"));
+    /* Everything that is not RTSP-specific still applies. */
+    CHECK(has_pair(count, "-fflags", "+genpts+discardcorrupt"));
+    CHECK(has_pair(count, "-avoid_negative_ts", "make_zero"));
+    CHECK(has_pair(count, "-i", "/srv/footage/yesterday.mkv"));
+
+    /* And scanning a file wants it as fast as it will go. */
+    request.realtime = false;
+    count = krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
+                             sizeof(storage));
+    CHECK(count > 0u);
+    CHECK(!has_arg(count, "-re"));
+
+    /* rtsps is still a camera. */
+    krtsp_args_request_init(&request);
+    request.url = "rtsps://camera.example/stream";
+    count = krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
+                             sizeof(storage));
+    CHECK(has_pair(count, "-rtsp_transport", "tcp"));
+    CHECK(!has_arg(count, "-re"));
+    return true;
+}
+
 static bool
 test_pixel_format_follows_the_consumer(void)
 {
@@ -620,6 +667,8 @@ main(void)
 {
     static const test_case tests[] = {
         {"defaults", test_defaults},
+        {"a local file is not given rtsp options",
+         test_a_local_file_is_not_given_rtsp_options},
         {"pixel format follows the consumer",
          test_pixel_format_follows_the_consumer},
         {"scale and fps", test_scale_and_fps},

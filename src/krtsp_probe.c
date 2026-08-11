@@ -5,6 +5,7 @@
 #include "krtsp_exec.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 int krtsp_run_ffprobe(const char *url, bool force_tcp, char *output,
                       size_t capacity, int timeout_ms)
@@ -27,8 +28,14 @@ int krtsp_run_ffprobe(const char *url, bool force_tcp, char *output,
         argv[at++] = (char *)"-rtsp_transport";
         argv[at++] = (char *)"tcp";
     }
-    argv[at++] = (char *)"-timeout";
-    argv[at++] = (char *)"5000000";
+    /* A socket timeout is a socket option: the file protocol has none, and
+     * ffprobe exits rather than ignoring an option it does not know.  So a
+     * local recording could not be probed at all. */
+    if (strncmp(url, "rtsp://", 7) == 0 || strncmp(url, "rtsps://", 8) == 0 ||
+        strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
+        argv[at++] = (char *)"-timeout";
+        argv[at++] = (char *)"5000000";
+    }
     /* Low-bitrate substreams need enough input to determine geometry. */
     argv[at++] = (char *)"-analyzeduration";
     argv[at++] = (char *)"5000000";
