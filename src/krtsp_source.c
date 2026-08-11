@@ -384,6 +384,7 @@ static void fill_args_request(const krtsp_source *source,
     request->pixfmt = source->options.pixfmt;
     request->low_latency = source->options.low_latency;
     request->realtime = source->options.realtime;
+    request->seek_seconds = source->options.seek_seconds;
     request->letterbox = source->options.letterbox;
     request->legacy_timeout_flag = source->legacy_timeout;
     request->roles = source->roles;
