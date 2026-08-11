@@ -120,6 +120,7 @@ void krtsp_source_options_init(krtsp_source_options *options)
     options->fps_cap = 0;
     options->pixfmt = KRTSP_PIXFMT_RGBA;
     options->low_latency = true;
+    options->realtime = true;
     options->letterbox = false;
     options->stall_ms = 20000;
     options->grace_ms = 15000;
@@ -382,6 +383,7 @@ static void fill_args_request(const krtsp_source *source,
     request->fps_cap = source->options.fps_cap;
     request->pixfmt = source->options.pixfmt;
     request->low_latency = source->options.low_latency;
+    request->realtime = source->options.realtime;
     request->letterbox = source->options.letterbox;
     request->legacy_timeout_flag = source->legacy_timeout;
     request->roles = source->roles;

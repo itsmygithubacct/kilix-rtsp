@@ -388,6 +388,11 @@ typedef struct krtsp_source_options {
     krtsp_pixfmt pixfmt;
     bool low_latency;
 
+    /* Pace a local input at its own frame rate (-re); ignored for RTSP.
+     * Default true, so a recording stands in for a camera; false to get
+     * through a file as fast as it will decode. */
+    bool realtime;
+
     /* Scale-to-fit and pad, so frames arrive at exactly width x height
      * whatever the camera's aspect ratio is.  See krtsp_args_request. */
     bool letterbox;
