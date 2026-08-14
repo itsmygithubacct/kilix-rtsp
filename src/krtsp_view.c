@@ -119,12 +119,11 @@ static void draw_banner(sr_canvas *canvas, const char *text, uint32_t accent)
         width = canvas->w;
     }
     /* A translucent plate keeps the text readable over a bright scene
-     * without hiding the part of the picture that matters. */
-    for (int y = 0; y < height && y < canvas->h; ++y) {
-        for (int x = 0; x < width; ++x) {
-            sr_blend(canvas, x, y, 0x000000u, 0.55f);
-        }
-    }
+     * without hiding the part of the picture that matters.  The fill
+     * blends the same pixels a per-pixel loop would - integer-aligned
+     * edges have coverage 1, and test_compose pins the equivalence. */
+    sr_fill_rect(canvas, 0.0f, 0.0f, (float)width, (float)height,
+                 0x000000u, 0.55f);
     sr_fill_rect(canvas, 0.0f, 0.0f, 3.0f * (float)scale, (float)height,
                  accent, 1.0f);
     sr_text_shadow(canvas, (float)pad, (float)pad, text, 0xFFFFFFu, 1.0f,
