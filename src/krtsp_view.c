@@ -22,6 +22,7 @@
 #include "kilix_rtsp.h"
 #include "krtsp_view.h"
 #include "krtsp_attach.h"
+#include "krtsp_compose.h"
 #include "krtsp_source_internal.h"
 
 #include "kitty_terminal_session.h"
@@ -513,7 +514,7 @@ int krtsp_mosaic_run(
     mosaic_slot slots[KRTSP_MOSAIC_MAX];
     krtsp_tile tiles[KRTSP_MOSAIC_MAX];
     krtsp_attach attach;
-    sr_canvas canvas;
+    krtsp_compositor compositor = {0};
     uint8_t *present_buffer = NULL;
     long long attach_checked_at = 0;
     long long resize_pending_at = 0;
@@ -561,9 +562,11 @@ int krtsp_mosaic_run(
         slots[index].label = labels[index];
     }
     present_buffer = malloc(present_size);
-    if (present_buffer == NULL || !mosaic_start_sources(slots, count, urls,
-                                                        fps_cap)) {
+    if (present_buffer == NULL ||
+        !krtsp_compositor_init(&compositor, width, height) ||
+        !mosaic_start_sources(slots, count, urls, fps_cap)) {
         mosaic_stop_sources(slots, count);
+        krtsp_compositor_free(&compositor);
         free(present_buffer);
         kittyts_stop(&session);
         g_session = NULL;
@@ -619,6 +622,11 @@ int krtsp_mosaic_run(
                     present_size = new_size;
                     width = new_width;
                     height = new_height;
+                    krtsp_compositor_free(&compositor);
+                    if (!krtsp_compositor_init(&compositor, width, height)) {
+                        exit_code = 1;
+                        break;
+                    }
                     mosaic_stop_sources(slots, count);
                     for (size_t index = 0u; index < count; ++index) {
                         slots[index].tile = tiles[index];
@@ -673,81 +681,68 @@ int krtsp_mosaic_run(
         }
         composed_at = monotonic_ms();
 
-        sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
-                       width, height);
-        sr_clear(&canvas, 0x0A0A0Cu);
+        {
+            krtsp_compose_tile inputs[KRTSP_MOSAIC_MAX];
+            char captions[KRTSP_MOSAIC_MAX][128];
+            bool composed;
 
-        for (size_t index = 0u; index < count; ++index) {
-            const krtsp_tile *tile = &slots[index].tile;
-            krtsp_status status = krtsp_source_status(slots[index].source);
-            const uint8_t *pixels;
-            int age_ms = 0;
-            char caption[128];
-            uint64_t sequence = 0u;
+            for (size_t index = 0u; index < count; ++index) {
+                krtsp_status status =
+                    krtsp_source_status(slots[index].source);
+                int age_ms = 0;
+                uint64_t sequence = 0u;
+                const uint8_t *pixels = krtsp_source_borrow_latest(
+                    slots[index].source, &sequence, &age_ms);
 
-            pixels = krtsp_source_borrow_latest(
-                slots[index].source, &sequence, &age_ms);
-            if (pixels != NULL) {
-                sr_canvas source_canvas;
-
-                sr_canvas_wrap(&source_canvas,
-                               (uint32_t *)(void *)(uintptr_t)pixels,
-                               tile->width, tile->height);
-                sr_blit(&canvas, &source_canvas, tile->x, tile->y);
-                krtsp_source_release(slots[index].source);
-                slots[index].last_frames = sequence;
-            } else {
-                sr_fill_rect(&canvas, (float)tile->x, (float)tile->y,
-                             (float)tile->width, (float)tile->height,
-                             0x141418u, 1.0f);
-                slots[index].last_frames = 0u;
-            }
-            slots[index].last_status = status;
-
-            /* Every tile is captioned.  In a grid, "which camera is
-             * that" is the first question, and an unlabelled tile that
-             * has frozen is indistinguishable from a quiet scene. */
-            if (pixels == NULL) {
-                (void)snprintf(caption, sizeof(caption), "%s  %s",
-                               slots[index].label,
-                               status == KRTSP_STARTING ? "connecting"
-                                                        : krtsp_status_name(status));
-            } else if (status != KRTSP_ONLINE || age_ms > 2000) {
-                (void)snprintf(caption, sizeof(caption), "%s  %s  %.0fs",
-                               slots[index].label, krtsp_status_name(status),
-                               (double)age_ms / 1000.0);
-            } else {
-                (void)snprintf(caption, sizeof(caption), "%s",
-                               slots[index].label);
-            }
-            {
-                int pad = 4;
-                int band = SR_FONT_H + pad;
-
-                for (int y = 0; y < band && tile->y + y < height; ++y) {
-                    for (int x = 0; x < tile->width; ++x) {
-                        sr_blend(&canvas, tile->x + x, tile->y + y,
-                                 0x000000u, 0.5f);
-                    }
+                /* Every tile is captioned.  In a grid, "which camera is
+                 * that" is the first question, and an unlabelled tile
+                 * that has frozen is indistinguishable from a quiet
+                 * scene. */
+                if (pixels == NULL) {
+                    (void)snprintf(captions[index], sizeof(captions[index]),
+                                   "%s  %s", slots[index].label,
+                                   status == KRTSP_STARTING
+                                       ? "connecting"
+                                       : krtsp_status_name(status));
+                } else if (status != KRTSP_ONLINE || age_ms > 2000) {
+                    (void)snprintf(captions[index], sizeof(captions[index]),
+                                   "%s  %s  %.0fs", slots[index].label,
+                                   krtsp_status_name(status),
+                                   (double)age_ms / 1000.0);
+                } else {
+                    (void)snprintf(captions[index], sizeof(captions[index]),
+                                   "%s", slots[index].label);
                 }
-                sr_fill_rect(&canvas, (float)tile->x, (float)tile->y, 3.0f,
-                             (float)band,
-                             status_accent(status), 1.0f);
-                sr_text_shadow(&canvas, (float)(tile->x + pad + 3),
-                               (float)(tile->y + pad / 2), caption,
-                               0xFFFFFFu, 1.0f, 1);
+                inputs[index].tile = slots[index].tile;
+                inputs[index].pixels = pixels;
+                inputs[index].sequence = sequence;
+                inputs[index].caption = captions[index];
+                inputs[index].accent = status_accent(status);
+                slots[index].last_frames = pixels != NULL ? sequence : 0u;
+                slots[index].last_status = status;
             }
-        }
 
-        (void)sr_pack_rgba(&canvas, present_buffer, present_size);
-        if (!kittyts_present(&session, present_buffer, width, height)) {
-            exit_code = 1;
-            break;
+            /* Borrows are held across the composite: the blit reads the
+             * ring slot directly, so releasing early would let a fresh
+             * frame land under the copy. */
+            composed = krtsp_compose(&compositor, inputs, count,
+                                     present_buffer, present_size);
+            for (size_t index = 0u; index < count; ++index) {
+                if (inputs[index].pixels != NULL) {
+                    krtsp_source_release(slots[index].source);
+                }
+            }
+            if (!composed ||
+                !kittyts_present(&session, present_buffer, width, height)) {
+                exit_code = 1;
+                break;
+            }
         }
         sleep_ms(8);
     }
 
     mosaic_stop_sources(slots, count);
+    krtsp_compositor_free(&compositor);
     free(present_buffer);
     kittyts_stop(&session);
     g_session = NULL;

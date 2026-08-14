@@ -34,6 +34,7 @@ VIEW_SOURCES := \
 	src/main.c \
 	src/krtsp_probe.c \
 	src/krtsp_view.c \
+	src/krtsp_compose.c \
 	src/krtsp_attach.c
 
 # Vendored dependencies, compiled with the project's flags minus the
@@ -78,7 +79,8 @@ TESTS := \
 	$(BUILD_DIR)/test-source \
 	$(BUILD_DIR)/test-probe \
 	$(BUILD_DIR)/test-config \
-	$(BUILD_DIR)/test-mosaic
+	$(BUILD_DIR)/test-mosaic \
+	$(BUILD_DIR)/test-compose
 
 FAKE_FFMPEG := $(BUILD_DIR)/fake-ffmpeg
 
@@ -133,6 +135,14 @@ $(BUILD_DIR)/test-probe: tests/test_probe.c $(BUILD_DIR)/krtsp_probe.o \
 		$(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -Isrc $< \
 		$(BUILD_DIR)/krtsp_probe.o $(STATIC_LIB) $(LDLIBS) -o $@
+
+# The composite is exercised against a reference implementation, so it
+# needs the compose object and the raster it draws with.
+$(BUILD_DIR)/test-compose: tests/test_compose.c $(BUILD_DIR)/krtsp_compose.o \
+		$(BUILD_DIR)/vendor/soft_raster.o $(STATIC_LIB) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(VIEW_CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -Isrc $< \
+		$(BUILD_DIR)/krtsp_compose.o $(BUILD_DIR)/vendor/soft_raster.o \
+		$(STATIC_LIB) $(LDLIBS) -lm -o $@
 
 test: $(TESTS) $(FAKE_FFMPEG) $(BUILD_DIR)/kilix-rtsp
 	@set -e; for t in $(TESTS); do \
