@@ -72,7 +72,11 @@ A healthy full-window source is decoded directly as RGBA and handed to the
 presenter without a separate full-frame format conversion. A degraded/frozen
 frame is copied only when a status banner must be drawn. Mosaic sources decode
 to their tile sizes, and independent camera arrivals are coalesced into at most
-20 full-canvas composites per second rather than redrawing once per tile event.
+20 composites per second rather than redrawing once per tile event. The mosaic
+canvas persists between composites, so each one redraws only the tiles that
+changed and tells the presenter exactly which regions those were; the presenter
+patches the on-screen image rather than retransmitting the canvas, falling back
+to a full frame by itself whenever patching cannot help.
 
 ## Sharing one decode
 

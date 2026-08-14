@@ -115,6 +115,11 @@ typedef struct scene {
     krtsp_compositor compositor;
     uint8_t *out_new;
     uint8_t *out_ref;
+    uint8_t *out_prev;
+    uint8_t *out_patched;
+    bool prev_valid;
+    krtsp_damage damage[KRTSP_COMPOSE_MAX + 1];
+    size_t damage_count;
     size_t out_size;
 } scene;
 
@@ -127,8 +132,12 @@ static void scene_drop(scene *sc)
     krtsp_compositor_free(&sc->compositor);
     free(sc->out_new);
     free(sc->out_ref);
+    free(sc->out_prev);
+    free(sc->out_patched);
     sc->out_new = NULL;
     sc->out_ref = NULL;
+    sc->out_prev = NULL;
+    sc->out_patched = NULL;
 }
 
 static bool scene_build(scene *sc, int width, int height, size_t count)
@@ -143,7 +152,10 @@ static bool scene_build(scene *sc, int width, int height, size_t count)
     CHECK(krtsp_compositor_init(&sc->compositor, width, height));
     sc->out_new = malloc(sc->out_size);
     sc->out_ref = malloc(sc->out_size);
-    CHECK(sc->out_new != NULL && sc->out_ref != NULL);
+    sc->out_prev = malloc(sc->out_size);
+    sc->out_patched = malloc(sc->out_size);
+    CHECK(sc->out_new != NULL && sc->out_ref != NULL &&
+          sc->out_prev != NULL && sc->out_patched != NULL);
     for (size_t index = 0u; index < count; ++index) {
         size_t bytes = (size_t)sc->tiles[index].width *
                        (size_t)sc->tiles[index].height * 4u;
@@ -174,17 +186,57 @@ static void scene_inputs(const scene *sc,
     }
 }
 
-/* Compose both ways and demand identical bytes. */
+/*
+ * Compose both ways and demand identical bytes.  The damage report is
+ * held to its contract too: rectangles stay inside the canvas, and
+ * patching only the reported rectangles over the previous output must
+ * reproduce the new output exactly - every changed byte is inside some
+ * rectangle or the report lied.
+ */
 static bool scene_agrees(scene *sc)
 {
     krtsp_compose_tile inputs[KRTSP_COMPOSE_MAX];
 
     scene_inputs(sc, inputs);
     CHECK(krtsp_compose(&sc->compositor, inputs, sc->count, sc->out_new,
-                        sc->out_size));
+                        sc->out_size, sc->damage,
+                        KRTSP_COMPOSE_MAX + 1u, &sc->damage_count));
     CHECK(reference_compose(inputs, sc->count, sc->width, sc->height,
                             sc->out_ref, sc->out_size));
     CHECK(memcmp(sc->out_new, sc->out_ref, sc->out_size) == 0);
+
+    CHECK(sc->damage_count <= KRTSP_COMPOSE_MAX + 1u);
+    for (size_t index = 0u; index < sc->damage_count; ++index) {
+        const krtsp_damage *rect = &sc->damage[index];
+
+        CHECK(rect->x0 >= 0 && rect->y0 >= 0);
+        CHECK(rect->x0 < rect->x1 && rect->y0 < rect->y1);
+        CHECK(rect->x1 <= sc->width && rect->y1 <= sc->height);
+    }
+    if (sc->prev_valid) {
+        (void)memcpy(sc->out_patched, sc->out_prev, sc->out_size);
+        for (size_t index = 0u; index < sc->damage_count; ++index) {
+            const krtsp_damage *rect = &sc->damage[index];
+
+            for (int y = rect->y0; y < rect->y1; ++y) {
+                size_t at = ((size_t)y * (size_t)sc->width +
+                             (size_t)rect->x0) * 4u;
+
+                (void)memcpy(sc->out_patched + at, sc->out_new + at,
+                             (size_t)(rect->x1 - rect->x0) * 4u);
+            }
+        }
+        CHECK(memcmp(sc->out_patched, sc->out_new, sc->out_size) == 0);
+    } else {
+        /* The first composite has no on-screen image to patch, so the
+         * whole canvas must be declared new. */
+        CHECK(sc->damage_count == 1u);
+        CHECK(sc->damage[0].x0 == 0 && sc->damage[0].y0 == 0);
+        CHECK(sc->damage[0].x1 == sc->width &&
+              sc->damage[0].y1 == sc->height);
+    }
+    (void)memcpy(sc->out_prev, sc->out_new, sc->out_size);
+    sc->prev_valid = true;
     return true;
 }
 
@@ -228,12 +280,19 @@ static bool test_update_sequence_stays_identical(void)
     CHECK(scene_build(&sc, 1280, 720, 7u));
     CHECK(scene_agrees(&sc));
 
-    /* One tile gets a new frame; the other six do not. */
+    /* One tile gets a new frame; the other six do not - and only that
+     * tile may be declared damaged. */
     sc.sequences[2] += 1u;
     fill_frame(sc.frames[2], sc.tiles[2].width, sc.tiles[2].height, 5077u);
     CHECK(scene_agrees(&sc));
+    CHECK(sc.damage_count == 1u);
+    CHECK(sc.damage[0].x0 == sc.tiles[2].x);
+    CHECK(sc.damage[0].y0 == sc.tiles[2].y);
+    CHECK(sc.damage[0].x1 == sc.tiles[2].x + sc.tiles[2].width);
+    CHECK(sc.damage[0].y1 == sc.tiles[2].y + sc.tiles[2].height);
 
-    /* Only a caption ages: the frozen-camera second counter. */
+    /* Only a caption ages: the frozen-camera second counter.  Damage
+     * shrinks to the caption band. */
     (void)snprintf(sc.captions[4], sizeof(sc.captions[4]),
                    "camera 4  stale  3s");
     sc.accents[4] = 0xE08030u;
@@ -241,6 +300,11 @@ static bool test_update_sequence_stays_identical(void)
     (void)snprintf(sc.captions[4], sizeof(sc.captions[4]),
                    "camera 4  stale  4s");
     CHECK(scene_agrees(&sc));
+    CHECK(sc.damage_count == 1u);
+    CHECK(sc.damage[0].x0 == sc.tiles[4].x);
+    CHECK(sc.damage[0].y0 == sc.tiles[4].y);
+    CHECK(sc.damage[0].x1 == sc.tiles[4].x + sc.tiles[4].width);
+    CHECK(sc.damage[0].y1 == sc.tiles[4].y + SR_FONT_H + 4);
 
     /* A camera drops out entirely, then comes back. */
     sc.present[5] = false;
@@ -259,8 +323,10 @@ static bool test_update_sequence_stays_identical(void)
     sc.accents[0] = 0xC0A040u;
     CHECK(scene_agrees(&sc));
 
-    /* Nothing changes at all: composing again must be idempotent. */
+    /* Nothing changes at all: composing again must be idempotent, and
+     * honesty is an empty damage report. */
     CHECK(scene_agrees(&sc));
+    CHECK(sc.damage_count == 0u);
 
     /* Everything changes at once. */
     for (size_t index = 0u; index < sc.count; ++index) {
@@ -360,38 +426,86 @@ static bool test_plate_fill_equals_blend_loop(void)
     return true;
 }
 
+static bool test_reset_forgets_the_canvas(void)
+{
+    scene sc;
+
+    CHECK(scene_build(&sc, 1280, 720, 7u));
+    CHECK(scene_agrees(&sc));
+
+    /* After a reset nothing on screen can be assumed, so an unchanged
+     * scene must still be rebuilt and declared damaged in full. */
+    krtsp_compositor_reset(&sc.compositor);
+    sc.prev_valid = false;
+    CHECK(scene_agrees(&sc));
+    CHECK(sc.damage_count == 1u);
+
+    /* And incremental behavior resumes afterwards. */
+    sc.sequences[1] += 1u;
+    fill_frame(sc.frames[1], sc.tiles[1].width, sc.tiles[1].height, 733u);
+    CHECK(scene_agrees(&sc));
+    CHECK(sc.damage_count == 1u);
+    CHECK(sc.damage[0].x1 - sc.damage[0].x0 == sc.tiles[1].width);
+
+    scene_drop(&sc);
+    return true;
+}
+
 static bool test_refusals(void)
 {
     scene sc;
     krtsp_compose_tile inputs[KRTSP_COMPOSE_MAX];
     krtsp_compositor dead;
+    size_t rects = 0u;
     uint8_t sliver[16];
 
     CHECK(scene_build(&sc, 640, 360, 2u));
     scene_inputs(&sc, inputs);
 
     CHECK(!krtsp_compose(&sc.compositor, inputs, 0u, sc.out_new,
-                         sc.out_size));
+                         sc.out_size, sc.damage, 1u, &rects));
     CHECK(!krtsp_compose(&sc.compositor, inputs, KRTSP_COMPOSE_MAX + 1u,
-                         sc.out_new, sc.out_size));
+                         sc.out_new, sc.out_size, sc.damage, 1u, &rects));
     CHECK(!krtsp_compose(&sc.compositor, NULL, sc.count, sc.out_new,
-                         sc.out_size));
+                         sc.out_size, sc.damage, 1u, &rects));
     CHECK(!krtsp_compose(&sc.compositor, inputs, sc.count, NULL,
-                         sc.out_size));
+                         sc.out_size, sc.damage, 1u, &rects));
     CHECK(!krtsp_compose(&sc.compositor, inputs, sc.count, sliver,
-                         sizeof(sliver)));
+                         sizeof(sliver), sc.damage, 1u, &rects));
+    /* A damage array without a count, or with no room at all, cannot be
+     * reported into. */
+    CHECK(!krtsp_compose(&sc.compositor, inputs, sc.count, sc.out_new,
+                         sc.out_size, sc.damage, 1u, NULL));
+    CHECK(!krtsp_compose(&sc.compositor, inputs, sc.count, sc.out_new,
+                         sc.out_size, sc.damage, 0u, &rects));
     inputs[1].caption = NULL;
     CHECK(!krtsp_compose(&sc.compositor, inputs, sc.count, sc.out_new,
-                         sc.out_size));
+                         sc.out_size, sc.damage, 1u, &rects));
     inputs[1].caption = sc.captions[1];
 
     (void)memset(&dead, 0, sizeof(dead));
-    CHECK(!krtsp_compose(&dead, inputs, sc.count, sc.out_new, sc.out_size));
+    CHECK(!krtsp_compose(&dead, inputs, sc.count, sc.out_new, sc.out_size,
+                         sc.damage, 1u, &rects));
     CHECK(!krtsp_compositor_init(NULL, 640, 360));
     CHECK(!krtsp_compositor_init(&dead, 0, 360));
     CHECK(!krtsp_compositor_init(&dead, 640, -1));
 
+    /* A caller that wants no damage report may pass NULL. */
+    CHECK(krtsp_compose(&sc.compositor, inputs, sc.count, sc.out_new,
+                        sc.out_size, NULL, 0u, NULL));
+    /* Two changed tiles into a one-rectangle report: it collapses to
+     * one whole-canvas rectangle rather than dropping a change. */
+    sc.sequences[0] += 1u;
+    sc.sequences[1] += 1u;
+    scene_inputs(&sc, inputs);
+    CHECK(krtsp_compose(&sc.compositor, inputs, sc.count, sc.out_new,
+                        sc.out_size, sc.damage, 1u, &rects));
+    CHECK(rects == 1u);
+    CHECK(sc.damage[0].x0 == 0 && sc.damage[0].y0 == 0);
+    CHECK(sc.damage[0].x1 == sc.width && sc.damage[0].y1 == sc.height);
+
     /* And after all the refusals, a real composite still works. */
+    krtsp_compositor_reset(&sc.compositor);
     CHECK(scene_agrees(&sc));
     scene_drop(&sc);
     return true;
@@ -414,6 +528,7 @@ main(void)
          test_update_sequence_stays_identical},
         {"wide caption still matches", test_wide_caption_still_matches},
         {"plate fill equals blend loop", test_plate_fill_equals_blend_loop},
+        {"reset forgets the canvas", test_reset_forgets_the_canvas},
         {"refusals", test_refusals}
     };
     size_t passed = 0u;

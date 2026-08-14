@@ -55,6 +55,8 @@ typedef struct rig {
 static bool compose_rig(rig *bench)
 {
     krtsp_compose_tile inputs[KRTSP_COMPOSE_MAX];
+    krtsp_damage damage[KRTSP_COMPOSE_MAX + 1];
+    size_t damage_count = 0u;
 
     for (size_t index = 0u; index < TILE_COUNT; ++index) {
         inputs[index].tile = bench->tiles[index];
@@ -64,7 +66,8 @@ static bool compose_rig(rig *bench)
         inputs[index].accent = bench->accents[index];
     }
     return krtsp_compose(&bench->compositor, inputs, TILE_COUNT,
-                         bench->out, bench->out_size);
+                         bench->out, bench->out_size, damage,
+                         KRTSP_COMPOSE_MAX + 1u, &damage_count);
 }
 
 static bool report(const char *name, size_t iterations, double started,
