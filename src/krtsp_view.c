@@ -591,6 +591,10 @@ int krtsp_mosaic_run(
                     break;
                 }
                 streaming = true;
+                /* Restarted sources restart their frame counters, so a
+                 * remembered sequence could match a frame it never saw.
+                 * Forget the canvas and rebuild. */
+                krtsp_compositor_reset(&compositor);
             }
         }
         if (!streaming) {
@@ -647,12 +651,12 @@ int krtsp_mosaic_run(
          * Redraw when some tile has a new frame, but no more often than
          * KRTSP_MOSAIC_MAX_FPS.
          *
-         * Compositing is per-canvas, not per-tile: one new frame costs a
-         * full clear, seven blits, seven captions and a pack of the whole
-         * canvas.  Seven cameras arriving independently at 8-20 fps would
-         * otherwise trigger up to seventy of those a second to produce at
-         * most twenty visibly different frames.  The cap turns most of
-         * that into one composite carrying several tiles' updates.
+         * The compositor redraws only the tiles that changed, but every
+         * composite still packs a complete frame.  Seven cameras
+         * arriving independently at 8-20 fps would otherwise trigger up
+         * to seventy composites a second to produce at most twenty
+         * visibly different frames; the cap turns most of that into one
+         * composite carrying several tiles' updates.
          */
         {
             long long now = monotonic_ms();
@@ -683,6 +687,9 @@ int krtsp_mosaic_run(
         {
             krtsp_compose_tile inputs[KRTSP_MOSAIC_MAX];
             char captions[KRTSP_MOSAIC_MAX][128];
+            krtsp_damage damage[KRTSP_MOSAIC_MAX + 1];
+            kittyfb_rect patch[KRTSP_MOSAIC_MAX + 1];
+            size_t damage_count = 0u;
             bool composed;
 
             for (size_t index = 0u; index < count; ++index) {
@@ -725,14 +732,31 @@ int krtsp_mosaic_run(
              * ring slot directly, so releasing early would let a fresh
              * frame land under the copy. */
             composed = krtsp_compose(&compositor, inputs, count,
-                                     present_buffer, present_size);
+                                     present_buffer, present_size,
+                                     damage,
+                                     sizeof(damage) / sizeof(damage[0]),
+                                     &damage_count);
             for (size_t index = 0u; index < count; ++index) {
                 if (inputs[index].pixels != NULL) {
                     krtsp_source_release(slots[index].source);
                 }
             }
-            if (!composed ||
-                !kittyts_present(&session, present_buffer, width, height)) {
+            if (!composed) {
+                exit_code = 1;
+                break;
+            }
+            /* The composite says which tiles changed, so let the
+             * presenter patch just those.  It falls back to a full
+             * frame by itself whenever patching cannot help, so this
+             * needs no reasoning about which is cheaper. */
+            for (size_t index = 0u; index < damage_count; ++index) {
+                patch[index].x0 = damage[index].x0;
+                patch[index].y0 = damage[index].y0;
+                patch[index].x1 = damage[index].x1;
+                patch[index].y1 = damage[index].y1;
+            }
+            if (!kittyts_present_damage(&session, present_buffer, width,
+                                        height, patch, damage_count)) {
                 exit_code = 1;
                 break;
             }
