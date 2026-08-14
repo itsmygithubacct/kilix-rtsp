@@ -84,8 +84,15 @@ TESTS := \
 
 FAKE_FFMPEG := $(BUILD_DIR)/fake-ffmpeg
 
+# Perf regression coverage, matching the vendored modules' convention:
+# the two hot first-party paths, printed as numbers rather than asserted
+# against thresholds, so runs stay comparable across commits.
+BENCHES := \
+	$(BUILD_DIR)/bench-frame \
+	$(BUILD_DIR)/bench-compose
+
 .DEFAULT_GOAL := all
-.PHONY: all clean install test sanitize
+.PHONY: all clean install test sanitize bench
 
 all: $(STATIC_LIB) $(SHARED_LIB) $(BUILD_DIR)/kilix-rtsp
 
@@ -144,6 +151,21 @@ $(BUILD_DIR)/test-compose: tests/test_compose.c $(BUILD_DIR)/krtsp_compose.o \
 		$(BUILD_DIR)/krtsp_compose.o $(BUILD_DIR)/vendor/soft_raster.o \
 		$(STATIC_LIB) $(LDLIBS) -lm -o $@
 
+$(BUILD_DIR)/bench-frame: benchmarks/bench_frame.c $(STATIC_LIB) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) $< $(STATIC_LIB) $(LDLIBS) -o $@
+
+$(BUILD_DIR)/bench-compose: benchmarks/bench_compose.c \
+		$(BUILD_DIR)/krtsp_compose.o $(BUILD_DIR)/vendor/soft_raster.o \
+		$(STATIC_LIB) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(VIEW_CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -Isrc $< \
+		$(BUILD_DIR)/krtsp_compose.o $(BUILD_DIR)/vendor/soft_raster.o \
+		$(STATIC_LIB) $(LDLIBS) -lm -o $@
+
+bench: $(BENCHES)
+	@set -e; for b in $(BENCHES); do \
+		printf '\n== %s ==\n' "$$b"; "$$b"; \
+	done
+
 test: $(TESTS) $(FAKE_FFMPEG) $(BUILD_DIR)/kilix-rtsp
 	@set -e; for t in $(TESTS); do \
 		printf '\n== %s ==\n' "$$t"; \
@@ -174,4 +196,4 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 -include $(OBJECTS:.o=.d) $(VIEW_OBJECTS:.o=.d) \
-	$(VENDOR_OBJECTS:.o=.d) $(TESTS:=.d) $(FAKE_FFMPEG).d
+	$(VENDOR_OBJECTS:.o=.d) $(TESTS:=.d) $(BENCHES:=.d) $(FAKE_FFMPEG).d
