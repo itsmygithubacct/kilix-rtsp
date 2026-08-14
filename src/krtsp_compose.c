@@ -61,12 +61,12 @@ static void draw_caption(sr_canvas *canvas, const krtsp_compose_tile *entry)
     int band = SR_FONT_H + pad;
 
     /* A translucent plate keeps the text readable over a bright scene
-     * without hiding the top of the picture. */
-    for (int y = 0; y < band && tile->y + y < canvas->h; ++y) {
-        for (int x = 0; x < tile->width; ++x) {
-            sr_blend(canvas, tile->x + x, tile->y + y, 0x000000u, 0.5f);
-        }
-    }
+     * without hiding the top of the picture.  For an integer-aligned
+     * rect the fill's edge coverage is exactly 1, so this lays down the
+     * same pixels a per-pixel blend loop would - test_compose holds it
+     * to that - without a call and a clip check per pixel. */
+    sr_fill_rect(canvas, (float)tile->x, (float)tile->y,
+                 (float)tile->width, (float)band, 0x000000u, 0.5f);
     sr_fill_rect(canvas, (float)tile->x, (float)tile->y, 3.0f, (float)band,
                  entry->accent, 1.0f);
     sr_text_shadow(canvas, (float)(tile->x + pad + 3),
