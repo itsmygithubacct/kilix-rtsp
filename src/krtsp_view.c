@@ -101,13 +101,15 @@ static void copy_rgba_to_canvas(uint32_t *canvas, const uint8_t *rgba,
 }
 
 /*
- * Draw a status banner.
+ * Draw a status banner, and report the region it covered so a caller
+ * can re-present just that.
  *
  * This is the most valuable thing on the screen.  A camera that froze an
  * hour ago keeps handing back a perfectly valid frame forever, and it is
  * indistinguishable from a quiet driveway until something says otherwise.
  */
-static void draw_banner(sr_canvas *canvas, const char *text, uint32_t accent)
+static void draw_banner(sr_canvas *canvas, const char *text, uint32_t accent,
+                        krtsp_damage *extent)
 {
     const int scale = canvas->w >= 960 ? 2 : 1;
     int text_width = sr_text_width(text, scale);
@@ -117,6 +119,12 @@ static void draw_banner(sr_canvas *canvas, const char *text, uint32_t accent)
 
     if (width > canvas->w) {
         width = canvas->w;
+    }
+    if (extent != NULL) {
+        extent->x0 = 0;
+        extent->y0 = 0;
+        extent->x1 = width;
+        extent->y1 = height < canvas->h ? height : canvas->h;
     }
     /* A translucent plate keeps the text readable over a bright scene
      * without hiding the part of the picture that matters.  The fill
@@ -225,6 +233,8 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     long long attach_checked_at = 0;
     uint8_t *present_buffer = NULL;
     uint64_t last_sequence = UINT64_MAX;
+    krtsp_damage banner_shown = {0, 0, 0, 0};
+    bool banner_on_screen = false;
     long long resize_pending_at = 0;
     long long status_presented_at = 0;
     int width;
@@ -310,6 +320,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                 }
                 streaming = true;
                 last_sequence = UINT64_MAX;
+                banner_on_screen = false;
             }
         }
         if (!streaming) {
@@ -356,6 +367,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                         break;
                     }
                     last_sequence = UINT64_MAX;
+                    banner_on_screen = false;
                 }
             }
         }
@@ -383,6 +395,8 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                 exit_code = 1;
                 break;
             }
+            /* The notice covers the canvas, banner included. */
+            banner_on_screen = false;
             sleep_ms(200);
             continue;
         }
@@ -417,6 +431,9 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
             last_sequence = sequence;
 
             if (degraded) {
+                krtsp_damage banner_rect;
+                bool presented;
+
                 /* Drawing over the frame needs a private copy: the
                  * borrowed buffer belongs to the source. */
                 copy_rgba_to_canvas((uint32_t *)(void *)present_buffer, pixels,
@@ -427,9 +444,46 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                 (void)snprintf(banner, sizeof(banner), "%s  %s  %.1fs old",
                                label, krtsp_status_name(status),
                                (double)age_ms / 1000.0);
-                draw_banner(&canvas, banner, status_accent(status));
+                draw_banner(&canvas, banner, status_accent(status),
+                            &banner_rect);
                 (void)sr_pack_rgba(&canvas, present_buffer, present_size);
                 status_presented_at = monotonic_ms();
+
+                if (!changed) {
+                    /* The picture on screen is this same frozen frame;
+                     * only the banner's age is new.  Patch the banner
+                     * region instead of resending the frame - together
+                     * with the previous banner's region, so a shorter
+                     * banner erases the overhang of a longer one.  The
+                     * presenter falls back to a full frame by itself
+                     * whenever patching cannot help. */
+                    kittyfb_rect rects[2];
+                    size_t rect_count = 1u;
+
+                    rects[0].x0 = banner_rect.x0;
+                    rects[0].y0 = banner_rect.y0;
+                    rects[0].x1 = banner_rect.x1;
+                    rects[0].y1 = banner_rect.y1;
+                    if (banner_on_screen) {
+                        rects[1].x0 = banner_shown.x0;
+                        rects[1].y0 = banner_shown.y0;
+                        rects[1].x1 = banner_shown.x1;
+                        rects[1].y1 = banner_shown.y1;
+                        rect_count = 2u;
+                    }
+                    presented = kittyts_present_damage(
+                        &session, present_buffer, width, height,
+                        rects, rect_count);
+                } else {
+                    presented = kittyts_present(&session, present_buffer,
+                                                width, height);
+                }
+                if (!presented) {
+                    exit_code = 1;
+                    break;
+                }
+                banner_shown = banner_rect;
+                banner_on_screen = true;
             } else {
                 bool presented =
                     kittyts_present(&session, pixels, width, height);
@@ -439,12 +493,10 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                     exit_code = 1;
                     break;
                 }
+                /* A clean frame just covered whatever banner was up. */
+                banner_on_screen = false;
                 sleep_ms(8);
                 continue;
-            }
-            if (!kittyts_present(&session, present_buffer, width, height)) {
-                exit_code = 1;
-                break;
             }
         }
         sleep_ms(8);
