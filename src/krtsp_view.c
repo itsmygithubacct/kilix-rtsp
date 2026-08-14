@@ -235,6 +235,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     uint64_t last_sequence = UINT64_MAX;
     krtsp_damage banner_shown = {0, 0, 0, 0};
     bool banner_on_screen = false;
+    int notice_shown = -1;
     long long resize_pending_at = 0;
     long long status_presented_at = 0;
     int width;
@@ -321,6 +322,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                 streaming = true;
                 last_sequence = UINT64_MAX;
                 banner_on_screen = false;
+                notice_shown = -1;
             }
         }
         if (!streaming) {
@@ -339,6 +341,9 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
          */
         if (kittyts_check_resize(&session, &new_width, &new_height)) {
             resize_pending_at = monotonic_ms();
+            /* Whatever the resize leaves on screen, the notice is not
+             * reliably it any more. */
+            notice_shown = -1;
         }
         if (resize_pending_at != 0 &&
             monotonic_ms() - resize_pending_at > 250) {
@@ -368,6 +373,9 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                     }
                     last_sequence = UINT64_MAX;
                     banner_on_screen = false;
+                    /* The resize scheduled a clear, so whatever was on
+                     * screen - the notice included - must be repainted. */
+                    notice_shown = -1;
                 }
             }
         }
@@ -383,23 +391,37 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
         if (pixels == NULL) {
             /* Nothing yet.  Say what is happening rather than showing a
              * black screen: a camera can take several seconds to produce
-             * its first frame, and silence looks like a failure. */
-            sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
-                           width, height);
-            (void)snprintf(banner, sizeof(banner), "%s: %s", label,
-                           status == KRTSP_STARTING ? "connecting"
-                                                    : krtsp_status_name(status));
-            draw_centered_notice(&canvas, banner);
-            (void)sr_pack_rgba(&canvas, present_buffer, present_size);
-            if (!kittyts_present(&session, present_buffer, width, height)) {
-                exit_code = 1;
-                break;
+             * its first frame, and silence looks like a failure.
+             *
+             * Between status changes the notice is byte-identical -
+             * nothing in it ages - so present it once per status and
+             * then only keep polling.  A view left pointed at an
+             * offline camera would otherwise push five identical
+             * full-canvas frames a second through the transport,
+             * indefinitely, to display nothing new. */
+            if ((int)status != notice_shown) {
+                sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
+                               width, height);
+                (void)snprintf(banner, sizeof(banner), "%s: %s", label,
+                               status == KRTSP_STARTING
+                                   ? "connecting"
+                                   : krtsp_status_name(status));
+                draw_centered_notice(&canvas, banner);
+                (void)sr_pack_rgba(&canvas, present_buffer, present_size);
+                if (!kittyts_present(&session, present_buffer, width,
+                                     height)) {
+                    exit_code = 1;
+                    break;
+                }
+                /* The notice covers the canvas, banner included. */
+                banner_on_screen = false;
+                notice_shown = (int)status;
             }
-            /* The notice covers the canvas, banner included. */
-            banner_on_screen = false;
             sleep_ms(200);
             continue;
         }
+        /* A frame means the notice is no longer what is on screen. */
+        notice_shown = -1;
 
         {
             bool degraded = status != KRTSP_ONLINE || age_ms > 2000;
