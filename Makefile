@@ -14,7 +14,7 @@ WARNINGS := \
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=c11 -fPIC $(WARNINGS) $(EXTRA_CFLAGS)
 override LDFLAGS += $(EXTRA_LDFLAGS)
-LDLIBS += -lpthread
+LDLIBS += -lpthread -lm
 DEPFLAGS := -MMD -MP
 
 # Vendored, pinned dependencies for the terminal-facing commands.  The
@@ -68,7 +68,10 @@ OBJECTS := \
 	$(BUILD_DIR)/krtsp_source.o \
 	$(BUILD_DIR)/krtsp_paths.o \
 	$(BUILD_DIR)/krtsp_config.o \
-	$(BUILD_DIR)/krtsp_mosaic.o
+	$(BUILD_DIR)/krtsp_mosaic.o \
+	$(BUILD_DIR)/krtsp_buffer.o \
+	$(BUILD_DIR)/krtsp_history.o \
+	$(BUILD_DIR)/krtsp_detect.o
 
 STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 SHARED_LIB := $(BUILD_DIR)/lib$(PROJECT).so
@@ -80,9 +83,13 @@ TESTS := \
 	$(BUILD_DIR)/test-probe \
 	$(BUILD_DIR)/test-config \
 	$(BUILD_DIR)/test-mosaic \
-	$(BUILD_DIR)/test-compose
+	$(BUILD_DIR)/test-compose \
+	$(BUILD_DIR)/test-buffer \
+	$(BUILD_DIR)/test-history \
+	$(BUILD_DIR)/test-detect
 
 FAKE_FFMPEG := $(BUILD_DIR)/fake-ffmpeg
+FAKE_DETECTOR := $(BUILD_DIR)/fake-detector
 
 # Perf regression coverage, matching the vendored modules' convention:
 # the two hot first-party paths, printed as numbers rather than asserted
@@ -134,6 +141,9 @@ $(BUILD_DIR)/kilix-rtsp: $(VIEW_OBJECTS) $(VENDOR_OBJECTS) \
 $(FAKE_FFMPEG): tests/fake_ffmpeg.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) $< -o $@
 
+$(FAKE_DETECTOR): tests/fake_detector.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) $< -lm -o $@
+
 $(BUILD_DIR)/test-%: tests/test_%.c $(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -Isrc $< $(STATIC_LIB) \
 		$(LDLIBS) -o $@
@@ -166,10 +176,10 @@ bench: $(BENCHES)
 		printf '\n== %s ==\n' "$$b"; "$$b"; \
 	done
 
-test: $(TESTS) $(FAKE_FFMPEG) $(BUILD_DIR)/kilix-rtsp
+test: $(TESTS) $(FAKE_FFMPEG) $(FAKE_DETECTOR) $(BUILD_DIR)/kilix-rtsp
 	@set -e; for t in $(TESTS); do \
 		printf '\n== %s ==\n' "$$t"; \
-		KRTSP_FAKE_FFMPEG="$(abspath $(FAKE_FFMPEG))" "$$t"; \
+		KRTSP_FAKE_FFMPEG="$(abspath $(FAKE_FFMPEG))" KRTSP_FAKE_DETECTOR="$(abspath $(FAKE_DETECTOR))" "$$t"; \
 	done
 	@KRTSP_FAKE_FFMPEG="$(abspath $(FAKE_FFMPEG))" \
 		sh tests/test_cli.sh "$(abspath $(BUILD_DIR)/kilix-rtsp)" \

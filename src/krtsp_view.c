@@ -23,16 +23,20 @@
 #include "krtsp_view.h"
 #include "krtsp_attach.h"
 #include "krtsp_compose.h"
+#include "krtsp_detect.h"
+#include "krtsp_history.h"
 #include "krtsp_source_internal.h"
 
 #include "kitty_terminal_session.h"
 #include "soft_raster.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -166,7 +170,7 @@ static uint32_t status_accent(krtsp_status status)
  * terminal is acquired, and two copies of this drifted apart once already
  * (the framebuffer size cap was raised in one and not the other).
  */
-static bool start_terminal(kittyts_session *session)
+static bool start_terminal(kittyts_session *session, bool mouse)
 {
     kittyts_options options;
 
@@ -184,6 +188,12 @@ static bool start_terminal(kittyts_session *session)
      */
     options.framebuffer.max_width = 7680;
     options.framebuffer.max_height = 4320;
+    if (mouse) {
+        /* Presses only: the view has one button, and motion reports would
+         * be a stream of events for a pointer that is only ever passing. */
+        options.mouse_tracking = KITTYIN_MOUSE_TRACKING_BUTTON;
+        options.pixel_mouse = true;
+    }
 
     if (kittyts_start(session, STDIN_FILENO, STDOUT_FILENO, &options) != 0) {
         if (errno == ENOTSUP) {
@@ -222,22 +232,603 @@ static void consume_input(kittyts_session *session)
     }
 }
 
-int krtsp_view_run(const char *url, const char *label, int fps_cap)
+/* ------------------------------- the view -------------------------------- */
+
+/* How long the help strip stays after a key or a click. */
+#define HELP_MS 4000
+/* A notice ("no detector installed") is read once, not lived with. */
+#define NOTICE_MS 7000
+/* A model at 20-100 ms a frame needs no more than this many offers a second
+ * to keep boxes on a walking person, and every offer copies a frame. */
+#define DETECT_INTERVAL_MS 200
+/* Boxes for a frame that is this old are no longer where the thing is. */
+#define DETECT_STALE_MS 2500
+#define SEGMENT_TABLE_MAX 4096
+#define SEGMENT_SECONDS 10
+
+typedef struct view_input {
+    krtsp_history_action history;
+    bool toggle_detect;
+    bool toggle_help;
+    bool click;
+    int click_x;
+    int click_y;
+    bool any;
+} view_input;
+
+static krtsp_history_action history_key(uint32_t key, uint32_t modifiers)
+{
+    bool shifted = (modifiers & KITTYKB_MOD_SHIFT) != 0u;
+
+    switch (key) {
+    case KITTYKB_KEY_LEFT:
+        return shifted ? KRTSP_HISTORY_BACK_LONG : KRTSP_HISTORY_BACK_SHORT;
+    case KITTYKB_KEY_RIGHT:
+        return shifted ? KRTSP_HISTORY_FORWARD_LONG
+                       : KRTSP_HISTORY_FORWARD_SHORT;
+    case KITTYKB_KEY_PAGE_UP:
+        return KRTSP_HISTORY_BACK_LONG;
+    case KITTYKB_KEY_PAGE_DOWN:
+        return KRTSP_HISTORY_FORWARD_LONG;
+    case KITTYKB_KEY_HOME:
+        return KRTSP_HISTORY_OLDEST;
+    case KITTYKB_KEY_END:
+        return KRTSP_HISTORY_LIVE_NOW;
+    case ' ':
+        return KRTSP_HISTORY_TOGGLE_PAUSE;
+    default:
+        return KRTSP_HISTORY_NONE;
+    }
+}
+
+/*
+ * Drain input for the view.  Any key or click counts as "the viewer is
+ * here", which is what raises the help strip; the keys that mean something
+ * are turned into actions and the rest do nothing but raise it.
+ */
+static void read_view_input(kittyts_session *session, view_input *out)
+{
+    kittyin_event event;
+
+    (void)memset(out, 0, sizeof(*out));
+    (void)kittyts_read_input(session);
+    while (kittyts_next_event(session, &event)) {
+        if (event.kind == KITTYIN_EVENT_KEY &&
+            event.data.key.action != KITTYKB_ACTION_RELEASE) {
+            uint32_t key = event.data.key.key;
+            krtsp_history_action action;
+
+            out->any = true;
+            if (key == 'q' || key == 'Q' || key == 27u) {
+                g_quit = 1;
+                continue;
+            }
+            if (key == 'd' || key == 'D') {
+                out->toggle_detect = true;
+                continue;
+            }
+            if (key == 'h' || key == 'H' || key == '?' ||
+                event.data.key.shifted_key == '?' ||
+                key == KITTYKB_KEY_F1 ||
+                (event.data.key.text_length > 0u &&
+                 event.data.key.text[0] == '?')) {
+                out->toggle_help = true;
+                continue;
+            }
+            action = history_key(key, event.data.key.modifiers);
+            if (action != KRTSP_HISTORY_NONE) {
+                out->history = action;
+            }
+        } else if (event.kind == KITTYIN_EVENT_MOUSE &&
+                   event.data.mouse.action == KITTYIN_MOUSE_PRESS &&
+                   event.data.mouse.button == 1u) {
+            out->any = true;
+            out->click = true;
+            out->click_x = event.data.mouse.x - kittyts_origin_x(session);
+            out->click_y = event.data.mouse.y - kittyts_origin_y(session);
+        }
+    }
+}
+
+/* Everything the overlay needs to say, gathered so drawing decides nothing. */
+typedef struct overlay_info {
+    bool history_available;
+    krtsp_history_mode mode;
+    int behind;
+    int span;                /* seconds in the buffer */
+    uint64_t buffer_bytes;
+    uint64_t buffer_max;
+    bool at_oldest;
+    bool help;
+    bool pinned;
+    bool detect_on;
+    krtsp_detector_state detect_state;
+    const char *detect_error;
+    const char *notice;
+    const krtsp_detection *boxes;
+    size_t box_count;
+} overlay_info;
+
+typedef struct button_box {
+    int x;
+    int y;
+    int width;
+    int height;
+    bool valid;
+} button_box;
+
+static uint32_t class_colour(int class_id)
+{
+    static const uint32_t palette[] = {
+        0x40C060u, 0xE0A030u, 0x4090E0u, 0xD05050u,
+        0xB060D0u, 0x30C0C0u, 0xD0D040u, 0xE07030u
+    };
+
+    return palette[(unsigned)(class_id < 0 ? 0 : class_id) %
+                   (sizeof(palette) / sizeof(palette[0]))];
+}
+
+static void plate(sr_canvas *canvas, int x, int y, int width, int height,
+                  float alpha)
+{
+    for (int row = y; row < y + height && row < canvas->h; ++row) {
+        for (int column = x; column < x + width && column < canvas->w;
+             ++column) {
+            if (row >= 0 && column >= 0) {
+                sr_blend(canvas, column, row, 0x000000u, alpha);
+            }
+        }
+    }
+}
+
+static void draw_boxes(sr_canvas *canvas, const overlay_info *info,
+                       int scale)
+{
+    for (size_t index = 0u; index < info->box_count; ++index) {
+        const krtsp_detection *box = &info->boxes[index];
+        uint32_t colour = class_colour(box->class_id);
+        char label[64];
+        int label_width;
+        int label_height = SR_FONT_H * scale;
+        int label_y;
+
+        sr_stroke_rect(canvas, (float)box->x0, (float)box->y0,
+                       (float)(box->x1 - box->x0), (float)(box->y1 - box->y0),
+                       (float)(2 * scale), colour, 1.0f);
+        (void)snprintf(label, sizeof(label), "%s %d%%",
+                       krtsp_detect_class_name(box->class_id),
+                       (int)(box->score * 100.0f + 0.5f));
+        label_width = sr_text_width(label, scale) + 6 * scale;
+        /* Above the box, or inside its top edge when there is no room. */
+        label_y = box->y0 - label_height - 2 * scale;
+        if (label_y < 0) {
+            label_y = box->y0 + 2 * scale;
+        }
+        plate(canvas, box->x0, label_y, label_width, label_height + 2 * scale,
+              0.65f);
+        sr_fill_rect(canvas, (float)box->x0, (float)label_y,
+                     (float)(2 * scale), (float)(label_height + 2 * scale),
+                     colour, 1.0f);
+        sr_text_shadow(canvas, (float)(box->x0 + 4 * scale),
+                       (float)(label_y + scale), label, 0xFFFFFFu, 1.0f,
+                       scale);
+    }
+}
+
+/* The top-left pill: where in time this picture is from. */
+static void draw_time_pill(sr_canvas *canvas, const overlay_info *info,
+                           int scale)
+{
+    char text[160];
+    char behind[24];
+    char size[24];
+    uint32_t accent;
+    int pad = 4 * scale;
+    int width;
+    int height;
+
+    if (!info->history_available) {
+        return;
+    }
+    if (info->mode == KRTSP_HISTORY_LIVE) {
+        /* Live is the default and says nothing until asked. */
+        if (!info->help) {
+            return;
+        }
+        krtsp_buffer_format_bytes(info->buffer_bytes, size, sizeof(size));
+        krtsp_history_format(info->span, behind, sizeof(behind));
+        (void)snprintf(text, sizeof(text), "LIVE  buffer %s  %s",
+                       behind + 1, size);
+        accent = 0x40C060u;
+    } else {
+        krtsp_history_format(info->behind, behind, sizeof(behind));
+        (void)snprintf(text, sizeof(text), "%s  %s%s",
+                       info->mode == KRTSP_HISTORY_PAUSED ? "PAUSED"
+                                                          : "REPLAY",
+                       behind, info->at_oldest ? "  start of buffer" : "");
+        accent = info->mode == KRTSP_HISTORY_PAUSED ? 0xE0A030u : 0x4090E0u;
+    }
+    width = sr_text_width(text, scale) + pad * 2;
+    height = SR_FONT_H * scale + pad * 2;
+    plate(canvas, 0, 0, width, height, 0.6f);
+    sr_fill_rect(canvas, 0.0f, 0.0f, (float)(3 * scale), (float)height,
+                 accent, 1.0f);
+    sr_text_shadow(canvas, (float)(pad + 2 * scale), (float)pad, text,
+                   0xFFFFFFu, 1.0f, scale);
+}
+
+/* The top-right badge: whether detection is on, and if not, why not. */
+static void draw_detect_badge(sr_canvas *canvas, const overlay_info *info,
+                              int scale)
+{
+    char text[200];
+    int pad = 4 * scale;
+    int width;
+    int height;
+    uint32_t accent = 0x40C060u;
+
+    if (info->notice != NULL && info->notice[0] != '\0') {
+        (void)snprintf(text, sizeof(text), "%s", info->notice);
+        accent = 0xE0A030u;
+    } else if (info->detect_on) {
+        if (info->detect_state == KRTSP_DETECTOR_FAILED) {
+            (void)snprintf(text, sizeof(text), "DETECT failed: %s",
+                           info->detect_error);
+            accent = 0xD04040u;
+        } else if (info->detect_state == KRTSP_DETECTOR_LOADING) {
+            (void)snprintf(text, sizeof(text), "DETECT loading model...");
+            accent = 0xC0A040u;
+        } else {
+            (void)snprintf(text, sizeof(text), "DETECT %zu",
+                           info->box_count);
+        }
+    } else {
+        return;
+    }
+    width = sr_text_width(text, scale) + pad * 2;
+    if (width > canvas->w) {
+        width = canvas->w;
+    }
+    height = SR_FONT_H * scale + pad * 2;
+    plate(canvas, canvas->w - width, 0, width, height, 0.6f);
+    sr_fill_rect(canvas, (float)(canvas->w - width), 0.0f,
+                 (float)(3 * scale), (float)height, accent, 1.0f);
+    sr_text_shadow(canvas, (float)(canvas->w - width + pad + 2 * scale),
+                   (float)pad, text, 0xFFFFFFu, 1.0f, scale);
+}
+
+/* The one button, always there: a small chip in the bottom-right corner.
+ * Hidden controls cannot be clicked, so it stays put and merely fades back
+ * when nobody is using the view. */
+static int chip_text(const overlay_info *info, char *out, size_t capacity)
+{
+    return snprintf(out, capacity, " [d] detect: %s ",
+                    !info->detect_on ? "off"
+                    : info->detect_state == KRTSP_DETECTOR_FAILED ? "failed"
+                    : info->detect_state == KRTSP_DETECTOR_LOADING ? "loading"
+                                                                   : "on");
+}
+
+static void draw_button(sr_canvas *canvas, const overlay_info *info,
+                        int scale, button_box *button)
+{
+    char chip[48];
+    int pad = 4 * scale;
+    int height = SR_FONT_H * scale + pad * 2;
+    int chip_width;
+    int x;
+    int y;
+    int h;
+    /* Dim when idle so a camera left on a wall shows the picture and not
+     * a control; solid while the strip is up or detection is running. */
+    bool quiet = !info->help && !info->detect_on;
+    float alpha = quiet ? 0.55f : 0.95f;
+    uint32_t fill = info->detect_on ? 0x2E7D46u : 0x3A3A44u;
+
+    (void)chip_text(info, chip, sizeof(chip));
+    chip_width = sr_text_width(chip, scale) + 2 * scale;
+    x = canvas->w - chip_width - pad;
+    y = canvas->h - height + scale;
+    h = height - 2 * scale;
+    sr_fill_rect(canvas, (float)x, (float)y, (float)chip_width, (float)h,
+                 fill, alpha);
+    sr_stroke_rect(canvas, (float)x, (float)y, (float)chip_width, (float)h,
+                   (float)scale, info->detect_on ? 0x6FE09Au : 0x8A8A99u,
+                   alpha);
+    sr_text(canvas, (float)(x + scale), (float)(canvas->h - height + pad),
+            chip, 0xFFFFFFu, alpha, scale);
+    button->x = x;
+    button->y = y;
+    button->width = chip_width;
+    button->height = h;
+    button->valid = true;
+}
+
+/*
+ * The strip along the bottom: the keys.  It is drawn only while somebody is
+ * using the view, and it is low: a single line of small text on a
+ * translucent plate that leaves the picture above it alone.
+ */
+static void draw_help_strip(sr_canvas *canvas, const overlay_info *info,
+                            int scale)
+{
+    static const char *const with_history[] = {
+        "Left/Right 10s   PgUp/PgDn 60s   Home start   End live   "
+        "Space pause   ? help   q quit",
+        "Left/Right 10s   Home/End   Space pause   q quit",
+        "Left/Right   End live   q"
+    };
+    static const char *const without_history[] = {
+        "history off   ? help   q quit",
+        "q quit"
+    };
+    const char *const *tiers = info->history_available ? with_history
+                                                       : without_history;
+    size_t tier_count = info->history_available ? 3u : 2u;
+    char chip[48];
+    const char *text = tiers[tier_count - 1u];
+    int pad = 4 * scale;
+    int height = SR_FONT_H * scale + pad * 2;
+    int top = canvas->h - height;
+    int room;
+
+    (void)chip_text(info, chip, sizeof(chip));
+    room = canvas->w - (sr_text_width(chip, scale) + 2 * scale) - pad * 3;
+    for (size_t index = 0u; index < tier_count; ++index) {
+        if (sr_text_width(tiers[index], scale) <= room) {
+            text = tiers[index];
+            break;
+        }
+    }
+    plate(canvas, 0, top, canvas->w, height, 0.6f);
+    sr_text_shadow(canvas, (float)pad, (float)(top + pad), text, 0xE0E0E0u,
+                   1.0f, scale);
+}
+
+/* Small unless the picture is very large: everything drawn here is a
+ * caption on somebody else's picture. */
+static int overlay_scale(int width)
+{
+    return width >= 1900 ? 2 : 1;
+}
+
+static void draw_overlay(sr_canvas *canvas, const overlay_info *info,
+                         button_box *button)
+{
+    int scale = overlay_scale(canvas->w);
+
+    button->valid = false;
+    draw_boxes(canvas, info, scale);
+    draw_time_pill(canvas, info, scale);
+    draw_detect_badge(canvas, info, scale);
+    if (info->help) {
+        draw_help_strip(canvas, info, scale);
+    }
+    draw_button(canvas, info, scale, button);
+}
+
+static bool in_button(const button_box *button, int x, int y)
+{
+    return button->valid && x >= button->x && x < button->x + button->width &&
+           y >= button->y && y < button->y + button->height;
+}
+
+/*
+ * Whether there is a live stream to keep a history of.  An ordinary file is
+ * already its own history - a buffer of a recording would copy what is on
+ * disk already - so it is the one thing refused; a camera, a UDP feed and a
+ * pipe are not.
+ */
+static bool is_live_source(const char *url)
+{
+    struct stat info;
+
+    return !(stat(url, &info) == 0 && S_ISREG(info.st_mode));
+}
+
+static bool segment_path(const char *dir, const krtsp_segment *segment,
+                         char *out, size_t capacity)
+{
+    return snprintf(out, capacity, "%s/%s", dir, segment->name) <
+           (int)capacity;
+}
+
+/* The view's mutable world, so the loop reads as decisions and not as a
+ * page of locals. */
+typedef struct view_state {
+    krtsp_history history;
+    krtsp_buffer_plan plan;
+    char buffer_dir[PATH_MAX];
+    bool buffering;
+    krtsp_segment *segments;
+    size_t segment_count;
+    uint64_t buffer_bytes;
+    long long scanned_at;
+
+    krtsp_source *replay;            /* a segment being played, or NULL */
+    char replay_name[KRTSP_SEGMENT_NAME_MAX];
+    bool replay_dirty;               /* the position jumped: reopen */
+
+    uint8_t *frozen;                 /* the frame a pause holds */
+    bool frozen_valid;
+
+    krtsp_detector *detector;
+    bool detect_on;
+    long long detect_submitted_at;
+    uint64_t detect_generation;
+    long long detect_answered_at;
+    krtsp_detection boxes[KRTSP_DETECT_MAX];
+    size_t box_count;
+    char notice[160];
+    long long notice_until;
+} view_state;
+
+static void set_notice(view_state *view, long long now_ms, const char *text)
+{
+    (void)snprintf(view->notice, sizeof(view->notice), "%s", text);
+    view->notice_until = now_ms + NOTICE_MS;
+}
+
+static void rescan(view_state *view, time_t now)
+{
+    view->segment_count = 0u;
+    view->buffer_bytes = 0u;
+    if (!view->buffering) {
+        return;
+    }
+    (void)krtsp_segments_prune(view->buffer_dir, &view->plan, now, 2u);
+    view->segment_count = krtsp_segments_scan(
+        view->buffer_dir, view->segments, SEGMENT_TABLE_MAX);
+    for (size_t index = 0u; index < view->segment_count; ++index) {
+        view->buffer_bytes += view->segments[index].bytes;
+    }
+}
+
+static time_t oldest_start(const view_state *view)
+{
+    return view->segment_count == 0u ? 0 : view->segments[0].start;
+}
+
+static void stop_replay(view_state *view)
+{
+    krtsp_source_stop(view->replay);
+    view->replay = NULL;
+    view->replay_name[0] = '\0';
+}
+
+static bool start_replay(view_state *view, const krtsp_source_options *live,
+                         const krtsp_segment *segment, int offset)
+{
+    krtsp_source_options options;
+    char path[PATH_MAX];
+
+    stop_replay(view);
+    if (!segment_path(view->buffer_dir, segment, path, sizeof(path))) {
+        return false;
+    }
+    krtsp_source_options_init(&options);
+    options.width = live->width;
+    options.height = live->height;
+    options.fps_cap = live->fps_cap;
+    options.letterbox = true;
+    options.pixfmt = KRTSP_PIXFMT_RGBA;
+    /* Paced like the camera it came from, so replay runs at the speed it
+     * was recorded, and opened at the moment rather than the segment's
+     * start: see seek_seconds. */
+    options.realtime = true;
+    options.seek_seconds = offset;
+    if (!krtsp_source_start(&view->replay, path, &options)) {
+        view->replay = NULL;
+        return false;
+    }
+    (void)snprintf(view->replay_name, sizeof(view->replay_name), "%s",
+                   segment->name);
+    return true;
+}
+
+/*
+ * Make the playback source match the history's position: nothing when live,
+ * the right segment at the right offset when replaying, and, when paused,
+ * just long enough to fetch the frame that is held.
+ */
+static void sync_replay(view_state *view, const krtsp_source_options *live,
+                        time_t now)
+{
+    krtsp_history *history = &view->history;
+    size_t index = 0u;
+    int offset = 0;
+
+    if (history->mode == KRTSP_HISTORY_LIVE) {
+        stop_replay(view);
+        return;
+    }
+    if (!krtsp_segments_locate(view->segments, view->segment_count,
+                               krtsp_history_position(history, now), &index,
+                               &offset) &&
+        view->segment_count == 0u) {
+        stop_replay(view);
+        krtsp_history_apply(history, KRTSP_HISTORY_LIVE_NOW, now, 0);
+        return;
+    }
+    if (history->mode == KRTSP_HISTORY_PAUSED) {
+        if (view->frozen_valid && !view->replay_dirty) {
+            stop_replay(view);
+            return;
+        }
+        if (view->replay == NULL || view->replay_dirty) {
+            (void)start_replay(view, live, &view->segments[index], offset);
+            view->replay_dirty = false;
+        }
+        return;
+    }
+    if (view->replay == NULL || view->replay_dirty ||
+        strcmp(view->replay_name, view->segments[index].name) != 0) {
+        (void)start_replay(view, live, &view->segments[index], offset);
+        view->replay_dirty = false;
+    }
+}
+
+static const char *detector_notice(void)
+{
+    return "no detector installed - run: kilix yolox install";
+}
+
+static void toggle_detect(view_state *view, long long now_ms)
+{
+    if (view->detect_on) {
+        krtsp_detector_stop(view->detector);
+        view->detector = NULL;
+        view->detect_on = false;
+        view->box_count = 0u;
+        return;
+    }
+    {
+        char storage[1024];
+        const char *argv[8];
+
+        if (krtsp_detect_resolve(storage, sizeof(storage), argv, 8u) == 0u) {
+            set_notice(view, now_ms, detector_notice());
+            return;
+        }
+        if (!krtsp_detector_start(&view->detector, argv)) {
+            set_notice(view, now_ms, "could not start the detector");
+            return;
+        }
+        view->detect_on = true;
+        view->detect_generation = 0u;
+        view->detect_submitted_at = 0;
+        view->detect_answered_at = now_ms;
+        view->box_count = 0u;
+    }
+}
+
+int krtsp_view_run(const char *url, const char *label,
+                   const krtsp_view_options *options)
 {
     kittyts_session session;
     krtsp_source *source = NULL;
     krtsp_source_options source_options;
+    view_state view;
+    view_input input;
+    overlay_info info;
+    button_box button = {0, 0, 0, 0, false};
     sr_canvas canvas;
     krtsp_attach attach;
     bool streaming = true;
     long long attach_checked_at = 0;
     uint8_t *present_buffer = NULL;
     uint64_t last_sequence = UINT64_MAX;
+    uint64_t last_replay_sequence = UINT64_MAX;
     krtsp_damage banner_shown = {0, 0, 0, 0};
     bool banner_on_screen = false;
     int notice_shown = -1;
     long long resize_pending_at = 0;
     long long status_presented_at = 0;
+    long long help_until = 0;
+    bool help_pinned = false;
+    bool overlay_dirty = true;
+    bool was_help = false;
+    int fps_cap = options != NULL ? options->fps_cap : 0;
     int width;
     int height;
     int exit_code = 0;
@@ -246,8 +837,10 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     if (url == NULL || label == NULL) {
         return 2;
     }
+    (void)memset(&view, 0, sizeof(view));
+    krtsp_history_init(&view.history);
 
-    if (!start_terminal(&session)) {
+    if (!start_terminal(&session, true)) {
         return 1;
     }
 
@@ -269,7 +862,38 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     source_options.letterbox = true;
     source_options.pixfmt = KRTSP_PIXFMT_RGBA;
 
+    /*
+     * The history buffer rides on the same ffmpeg session as the picture:
+     * the camera sees one client, the segments are the camera's own
+     * bitstream copied to disk, and nothing is re-encoded.
+     */
+    view.segments = calloc(SEGMENT_TABLE_MAX, sizeof(*view.segments));
+    if (view.segments != NULL && is_live_source(url) && options != NULL &&
+        options->buffer.kind != KRTSP_BUFFER_OFF) {
+        uint64_t free_bytes = 0u;
+        uint64_t total_bytes = 0u;
+
+        (void)krtsp_buffer_sweep();
+        if (krtsp_buffer_dir_make(label, view.buffer_dir,
+                                  sizeof(view.buffer_dir)) &&
+            krtsp_buffer_disk(view.buffer_dir, &free_bytes, &total_bytes)) {
+            krtsp_buffer_plan_make(&options->buffer, free_bytes, total_bytes,
+                                   &view.plan);
+            if (view.plan.enabled) {
+                view.buffering = true;
+                source_options.roles = KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD;
+                source_options.record_dir = view.buffer_dir;
+                source_options.segment_seconds = SEGMENT_SECONDS;
+            } else {
+                krtsp_buffer_dir_remove(view.buffer_dir);
+                view.buffer_dir[0] = '\0';
+            }
+        }
+    }
+
     if (!krtsp_source_start(&source, url, &source_options)) {
+        krtsp_buffer_dir_remove(view.buffer_dir);
+        free(view.segments);
         kittyts_stop(&session);
         g_session = NULL;
         (void)fprintf(stderr, "kilix-rtsp: cannot start the source\n");
@@ -277,21 +901,36 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
     }
 
     present_buffer = malloc(present_size);
-    if (present_buffer == NULL) {
+    view.frozen = malloc(present_size);
+    if (present_buffer == NULL || view.frozen == NULL) {
+        free(present_buffer);
+        free(view.frozen);
         krtsp_source_stop(source);
+        krtsp_buffer_dir_remove(view.buffer_dir);
+        free(view.segments);
         kittyts_stop(&session);
         g_session = NULL;
         return 1;
+    }
+    if (options != NULL && options->detect) {
+        toggle_detect(&view, monotonic_ms());
     }
 
     while (!g_quit) {
         int new_width;
         int new_height;
         int age_ms = 0;
-        const uint8_t *pixels;
+        const uint8_t *pixels = NULL;
+        krtsp_source *shown = NULL;
         krtsp_status status;
         char banner[192];
         uint64_t sequence = 0u;
+        long long now_ms = monotonic_ms();
+        time_t now = time(NULL);
+        bool replaying;
+        bool have_frame;
+        bool forced;
+        krtsp_damage banner_rect = {0, 0, 0, 0};
 
         /*
          * Stop decoding while nobody is looking.
@@ -306,13 +945,14 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
          * invisible - there is nothing on screen to suggest it is still
          * running.
          */
-        if (monotonic_ms() - attach_checked_at > 1000) {
+        if (now_ms - attach_checked_at > 1000) {
             bool attached = krtsp_attach_is_attached(&attach);
 
-            attach_checked_at = monotonic_ms();
+            attach_checked_at = now_ms;
             if (!attached && streaming) {
                 krtsp_source_stop(source);
                 source = NULL;
+                stop_replay(&view);
                 streaming = false;
             } else if (attached && !streaming) {
                 if (!krtsp_source_start(&source, url, &source_options)) {
@@ -321,6 +961,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                 }
                 streaming = true;
                 last_sequence = UINT64_MAX;
+                view.replay_dirty = true;
                 banner_on_screen = false;
                 notice_shown = -1;
             }
@@ -340,31 +981,39 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
          * handles by re-centring.
          */
         if (kittyts_check_resize(&session, &new_width, &new_height)) {
-            resize_pending_at = monotonic_ms();
+            resize_pending_at = now_ms;
             /* Whatever the resize leaves on screen, the notice is not
              * reliably it any more. */
             notice_shown = -1;
         }
-        if (resize_pending_at != 0 &&
-            monotonic_ms() - resize_pending_at > 250) {
+        if (resize_pending_at != 0 && now_ms - resize_pending_at > 250) {
             resize_pending_at = 0;
             new_width = kittyts_width(&session);
             new_height = kittyts_height(&session);
             if (new_width != width || new_height != height) {
                 size_t new_size;
                 uint8_t *grown = NULL;
+                uint8_t *grown_frozen = NULL;
 
                 if (rgba_size(new_width, new_height, &new_size)) {
                     grown = realloc(present_buffer, new_size);
+                    if (grown != NULL) {
+                        present_buffer = grown;
+                        grown_frozen = realloc(view.frozen, new_size);
+                    }
                 }
 
-                if (grown != NULL) {
-                    present_buffer = grown;
+                if (grown != NULL && grown_frozen != NULL) {
+                    view.frozen = grown_frozen;
+                    view.frozen_valid = false;
                     present_size = new_size;
                     width = new_width;
                     height = new_height;
                     krtsp_source_stop(source);
                     source = NULL;
+                    stop_replay(&view);
+                    view.replay_dirty = true;
+                    view.box_count = 0u;
                     source_options.width = width;
                     source_options.height = height;
                     if (!krtsp_source_start(&source, url, &source_options)) {
@@ -372,6 +1021,7 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                         break;
                     }
                     last_sequence = UINT64_MAX;
+                    overlay_dirty = true;
                     banner_on_screen = false;
                     /* The resize scheduled a clear, so whatever was on
                      * screen - the notice included - must be repainted. */
@@ -380,15 +1030,129 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
             }
         }
 
-        consume_input(&session);
+        read_view_input(&session, &input);
         if (g_quit) {
             break;
         }
+        if (input.any) {
+            help_until = now_ms + HELP_MS;
+            overlay_dirty = true;
+        }
+        if (input.toggle_help) {
+            help_pinned = !help_pinned;
+        }
+        if (input.click && in_button(&button, input.click_x, input.click_y)) {
+            input.toggle_detect = true;
+        }
+        if (input.toggle_detect) {
+            toggle_detect(&view, now_ms);
+            overlay_dirty = true;
+        }
+        if (view.notice_until != 0 && now_ms >= view.notice_until) {
+            view.notice[0] = '\0';
+            view.notice_until = 0;
+            overlay_dirty = true;
+        }
+
+        /* Keep the buffer's picture of itself current, about once a
+         * second: that is also when retention runs. */
+        if (view.buffering && now_ms - view.scanned_at >= 1000) {
+            view.scanned_at = now_ms;
+            rescan(&view, now);
+            if (krtsp_history_clamp(&view.history, now,
+                                    oldest_start(&view))) {
+                view.replay_dirty = true;
+                view.frozen_valid = false;
+            }
+        }
+
+        if (input.history != KRTSP_HISTORY_NONE) {
+            if (!view.buffering) {
+                set_notice(&view, now_ms,
+                           options != NULL &&
+                                   options->buffer.kind == KRTSP_BUFFER_OFF
+                               ? "history is off (--buffer)"
+                               : is_live_source(url)
+                                     ? "no room for a history buffer"
+                                     : "history needs a live stream");
+            } else {
+                krtsp_history_mode before = view.history.mode;
+                const uint8_t *hold = NULL;
+                int hold_age = 0;
+
+                /* A pause holds the frame on screen at that moment. */
+                if (input.history == KRTSP_HISTORY_TOGGLE_PAUSE &&
+                    before != KRTSP_HISTORY_PAUSED) {
+                    krtsp_source *from = before == KRTSP_HISTORY_LIVE
+                                             ? source : view.replay;
+
+                    hold = krtsp_source_borrow_latest(from, NULL, &hold_age);
+                    if (hold != NULL) {
+                        (void)memcpy(view.frozen, hold, present_size);
+                        view.frozen_valid = true;
+                        krtsp_source_release(from);
+                    }
+                }
+                if (krtsp_history_apply(&view.history, input.history, now,
+                                        oldest_start(&view))) {
+                    if (input.history != KRTSP_HISTORY_TOGGLE_PAUSE) {
+                        /* A jump: the held frame and the open segment are
+                         * both for a moment that is no longer this one. */
+                        view.replay_dirty = true;
+                        view.frozen_valid = false;
+                    } else if (view.history.mode == KRTSP_HISTORY_REPLAY) {
+                        /* Resuming: play on from where the pause was. */
+                        view.replay_dirty = true;
+                    }
+                    last_replay_sequence = UINT64_MAX;
+                    last_sequence = UINT64_MAX;
+                }
+                overlay_dirty = true;
+            }
+        }
+        if (view.buffering) {
+            sync_replay(&view, &source_options, now);
+        }
+
+        replaying = view.history.mode != KRTSP_HISTORY_LIVE;
+        have_frame = false;
+        if (view.history.mode == KRTSP_HISTORY_PAUSED) {
+            /* A held frame; fetch it from the reopened segment if a step
+             * moved the position, then let the source go. */
+            if (!view.frozen_valid && view.replay != NULL) {
+                const uint8_t *fetched = krtsp_source_borrow_latest(
+                    view.replay, &sequence, &age_ms);
+
+                if (fetched != NULL) {
+                    (void)memcpy(view.frozen, fetched, present_size);
+                    view.frozen_valid = true;
+                    krtsp_source_release(view.replay);
+                    stop_replay(&view);
+                    overlay_dirty = true;
+                }
+            }
+            if (view.frozen_valid) {
+                pixels = view.frozen;
+                have_frame = true;
+                /* Nothing new arrives; only the overlay redraws, which
+                 * overlay_dirty already says. */
+                sequence = last_replay_sequence;
+            }
+            shown = NULL;
+        } else if (replaying && view.replay != NULL) {
+            pixels = krtsp_source_borrow_latest(view.replay, &sequence,
+                                                &age_ms);
+            shown = view.replay;
+            have_frame = pixels != NULL;
+        } else if (!replaying) {
+            pixels = krtsp_source_borrow_latest(source, &sequence, &age_ms);
+            shown = source;
+            have_frame = pixels != NULL;
+        }
 
         status = krtsp_source_status(source);
-        pixels = krtsp_source_borrow_latest(source, &sequence, &age_ms);
 
-        if (pixels == NULL) {
+        if (!have_frame) {
             /* Nothing yet.  Say what is happening rather than showing a
              * black screen: a camera can take several seconds to produce
              * its first frame, and silence looks like a failure.
@@ -399,13 +1163,20 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
              * offline camera would otherwise push five identical
              * full-canvas frames a second through the transport,
              * indefinitely, to display nothing new. */
-            if ((int)status != notice_shown) {
+            int notice_key = replaying ? 1000 : (int)status;
+
+            if (notice_key != notice_shown) {
                 sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
                                width, height);
-                (void)snprintf(banner, sizeof(banner), "%s: %s", label,
-                               status == KRTSP_STARTING
-                                   ? "connecting"
-                                   : krtsp_status_name(status));
+                if (replaying) {
+                    (void)snprintf(banner, sizeof(banner),
+                                   "%s: opening history", label);
+                } else {
+                    (void)snprintf(banner, sizeof(banner), "%s: %s", label,
+                                   status == KRTSP_STARTING
+                                       ? "connecting"
+                                       : krtsp_status_name(status));
+                }
                 draw_centered_notice(&canvas, banner);
                 (void)sr_pack_rgba(&canvas, present_buffer, present_size);
                 if (!kittyts_present(&session, present_buffer, width,
@@ -415,117 +1186,219 @@ int krtsp_view_run(const char *url, const char *label, int fps_cap)
                 }
                 /* The notice covers the canvas, banner included. */
                 banner_on_screen = false;
-                notice_shown = (int)status;
+                notice_shown = notice_key;
             }
             sleep_ms(200);
             continue;
         }
-        /* A frame means the notice is no longer what is on screen. */
         notice_shown = -1;
 
         {
-            bool degraded = status != KRTSP_ONLINE || age_ms > 2000;
+            bool live_degraded = !replaying &&
+                                 (status != KRTSP_ONLINE || age_ms > 2000);
+            bool help_visible = help_pinned || now_ms < help_until;
             bool changed;
+            uint64_t *tracked = replaying ? &last_replay_sequence
+                                          : &last_sequence;
+            bool wants_detect;
 
-            /*
-             * Present only when a new frame has actually arrived.  The
-             * frame counter is the signal; re-sending an unchanged frame
-             * spends the whole transport budget for no visible gain, and
-             * these cameras deliver 8-20 fps against a loop that could
-             * spin far faster.
-             *
-             * A degraded source is the exception: the banner carries a
-             * live age, so it has to be redrawn even when the picture
-             * behind it is frozen.
-             */
-            changed = sequence != last_sequence;
-            if (!changed && !degraded) {
-                krtsp_source_release(source);
+            /* Boxes: offer the frame being shown to the detector, and
+             * take whatever it has answered. */
+            wants_detect = view.detect_on && view.detector != NULL;
+            if (wants_detect) {
+                uint64_t generation = 0u;
+
+                if (now_ms - view.detect_submitted_at >= DETECT_INTERVAL_MS &&
+                    krtsp_detector_submit(view.detector, pixels, width,
+                                          height)) {
+                    view.detect_submitted_at = now_ms;
+                }
+                view.box_count = krtsp_detector_take(
+                    view.detector, view.boxes, KRTSP_DETECT_MAX, &generation);
+                if (generation != view.detect_generation) {
+                    view.detect_generation = generation;
+                    view.detect_answered_at = now_ms;
+                    overlay_dirty = true;
+                }
+                if (view.box_count != 0u &&
+                    now_ms - view.detect_answered_at > DETECT_STALE_MS) {
+                    view.box_count = 0u;
+                    overlay_dirty = true;
+                }
+                if (krtsp_detector_status(view.detector) ==
+                    KRTSP_DETECTOR_FAILED) {
+                    overlay_dirty = true;
+                }
+            }
+            if (help_visible != was_help) {
+                was_help = help_visible;
+                overlay_dirty = true;
+            }
+
+            forced = overlay_dirty;
+            changed = sequence != *tracked;
+            if (!changed && !live_degraded && !forced) {
+                if (shown != NULL) {
+                    krtsp_source_release(shown);
+                }
                 sleep_ms(8);
                 continue;
             }
-            if (!changed && degraded &&
-                monotonic_ms() - status_presented_at < 250) {
-                krtsp_source_release(source);
+            if (!changed && live_degraded && !forced &&
+                now_ms - status_presented_at < 250) {
+                if (shown != NULL) {
+                    krtsp_source_release(shown);
+                }
                 sleep_ms(8);
                 continue;
             }
-            last_sequence = sequence;
+            *tracked = sequence;
+            overlay_dirty = false;
 
-            if (degraded) {
-                krtsp_damage banner_rect;
-                bool presented;
+            (void)memset(&info, 0, sizeof(info));
+            info.history_available = view.buffering;
+            info.mode = view.history.mode;
+            info.behind = krtsp_history_behind(&view.history, now);
+            info.span = view.segment_count == 0u
+                            ? 0 : (int)(now - oldest_start(&view));
+            info.buffer_bytes = view.buffer_bytes;
+            info.buffer_max = view.plan.max_bytes;
+            info.at_oldest = view.history.at_oldest &&
+                             view.history.mode != KRTSP_HISTORY_LIVE;
+            info.help = help_visible;
+            info.pinned = help_pinned;
+            info.detect_on = view.detect_on;
+            info.detect_state = view.detector != NULL
+                                    ? krtsp_detector_status(view.detector)
+                                    : KRTSP_DETECTOR_LOADING;
+            info.detect_error = view.detector != NULL
+                                    ? krtsp_detector_error(view.detector) : "";
+            info.notice = view.notice;
+            info.boxes = view.boxes;
+            info.box_count = view.box_count;
 
-                /* Drawing over the frame needs a private copy: the
-                 * borrowed buffer belongs to the source. */
-                copy_rgba_to_canvas((uint32_t *)(void *)present_buffer, pixels,
-                                    present_size / 4u);
-                krtsp_source_release(source);
-                sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
-                               width, height);
+            {
+                bool anything_to_draw =
+                    live_degraded || replaying || info.help ||
+                    info.detect_on || info.notice[0] != '\0';
+
+                if (!anything_to_draw) {
+                    /*
+                     * The path that runs almost all the time.  The only
+                     * thing on screen is the idle button, which lives in
+                     * the last few rows, so only those are converted and
+                     * drawn on; the rest of the frame goes to the terminal
+                     * exactly as it came.
+                     */
+                    int scale = overlay_scale(width);
+                    int rows = SR_FONT_H * scale + 8 * scale;
+                    bool presented;
+
+                    if (rows > height) {
+                        rows = height;
+                    }
+                    (void)memcpy(present_buffer, pixels, present_size);
+                    if (shown != NULL) {
+                        krtsp_source_release(shown);
+                    }
+                    {
+                        size_t first = (size_t)(height - rows) * (size_t)width;
+                        uint32_t *tail =
+                            (uint32_t *)(void *)present_buffer + first;
+
+                        copy_rgba_to_canvas(tail, (const uint8_t *)tail,
+                                            (size_t)rows * (size_t)width);
+                        sr_canvas_wrap(&canvas, tail, width, rows);
+                        button.valid = false;
+                        draw_button(&canvas, &info, scale, &button);
+                        button.y += height - rows;
+                        (void)sr_pack_rgba(&canvas, present_buffer + first * 4u,
+                                           (size_t)rows * (size_t)width * 4u);
+                    }
+                    presented = kittyts_present(&session, present_buffer,
+                                                width, height);
+                    banner_on_screen = false;
+                    if (!presented) {
+                        exit_code = 1;
+                        break;
+                    }
+                    sleep_ms(8);
+                    continue;
+                }
+            }
+
+            /* Drawing over the frame needs a private copy: the borrowed
+             * buffer belongs to the source. */
+            copy_rgba_to_canvas((uint32_t *)(void *)present_buffer, pixels,
+                                present_size / 4u);
+            if (shown != NULL) {
+                krtsp_source_release(shown);
+            }
+            sr_canvas_wrap(&canvas, (uint32_t *)(void *)present_buffer,
+                           width, height);
+            if (live_degraded) {
                 (void)snprintf(banner, sizeof(banner), "%s  %s  %.1fs old",
                                label, krtsp_status_name(status),
                                (double)age_ms / 1000.0);
                 draw_banner(&canvas, banner, status_accent(status),
                             &banner_rect);
-                (void)sr_pack_rgba(&canvas, present_buffer, present_size);
-                status_presented_at = monotonic_ms();
+                status_presented_at = now_ms;
+            }
+            draw_overlay(&canvas, &info, &button);
+            (void)sr_pack_rgba(&canvas, present_buffer, present_size);
+            if (live_degraded && !changed && !forced && !replaying &&
+                !info.help && !info.detect_on && info.notice[0] == '\0') {
+                /* The picture on screen is this same frozen frame; only
+                 * the banner's age is new.  Patch the banner region
+                 * instead of resending the frame - together with the
+                 * previous banner's region, so a shorter banner erases
+                 * the overhang of a longer one.  The presenter falls
+                 * back to a full frame by itself whenever patching
+                 * cannot help. */
+                kittyfb_rect rects[2];
+                size_t rect_count = 1u;
+                bool presented;
 
-                if (!changed) {
-                    /* The picture on screen is this same frozen frame;
-                     * only the banner's age is new.  Patch the banner
-                     * region instead of resending the frame - together
-                     * with the previous banner's region, so a shorter
-                     * banner erases the overhang of a longer one.  The
-                     * presenter falls back to a full frame by itself
-                     * whenever patching cannot help. */
-                    kittyfb_rect rects[2];
-                    size_t rect_count = 1u;
-
-                    rects[0].x0 = banner_rect.x0;
-                    rects[0].y0 = banner_rect.y0;
-                    rects[0].x1 = banner_rect.x1;
-                    rects[0].y1 = banner_rect.y1;
-                    if (banner_on_screen) {
-                        rects[1].x0 = banner_shown.x0;
-                        rects[1].y0 = banner_shown.y0;
-                        rects[1].x1 = banner_shown.x1;
-                        rects[1].y1 = banner_shown.y1;
-                        rect_count = 2u;
-                    }
-                    presented = kittyts_present_damage(
-                        &session, present_buffer, width, height,
-                        rects, rect_count);
-                } else {
-                    presented = kittyts_present(&session, present_buffer,
-                                                width, height);
+                rects[0].x0 = banner_rect.x0;
+                rects[0].y0 = banner_rect.y0;
+                rects[0].x1 = banner_rect.x1;
+                rects[0].y1 = banner_rect.y1;
+                if (banner_on_screen) {
+                    rects[1].x0 = banner_shown.x0;
+                    rects[1].y0 = banner_shown.y0;
+                    rects[1].x1 = banner_shown.x1;
+                    rects[1].y1 = banner_shown.y1;
+                    rect_count = 2u;
                 }
+                presented = kittyts_present_damage(
+                    &session, present_buffer, width, height, rects,
+                    rect_count);
                 if (!presented) {
                     exit_code = 1;
                     break;
                 }
+            } else if (!kittyts_present(&session, present_buffer, width,
+                                        height)) {
+                exit_code = 1;
+                break;
+            }
+            if (live_degraded) {
                 banner_shown = banner_rect;
                 banner_on_screen = true;
             } else {
-                bool presented =
-                    kittyts_present(&session, pixels, width, height);
-
-                krtsp_source_release(source);
-                if (!presented) {
-                    exit_code = 1;
-                    break;
-                }
-                /* A clean frame just covered whatever banner was up. */
                 banner_on_screen = false;
-                sleep_ms(8);
-                continue;
             }
         }
         sleep_ms(8);
     }
 
+    krtsp_detector_stop(view.detector);
+    stop_replay(&view);
     free(present_buffer);
+    free(view.frozen);
     krtsp_source_stop(source);
+    krtsp_buffer_dir_remove(view.buffer_dir);
+    free(view.segments);
     kittyts_stop(&session);
     g_session = NULL;
     return exit_code;
@@ -609,7 +1482,7 @@ int krtsp_mosaic_run(
     }
     (void)memset(slots, 0, sizeof(slots));
 
-    if (!start_terminal(&session)) {
+    if (!start_terminal(&session, false)) {
         return 1;
     }
 

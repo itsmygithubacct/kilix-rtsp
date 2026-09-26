@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -685,6 +686,116 @@ size_t krtsp_mosaic_layout(
 /* Columns the layout would choose; exposed for tests and diagnostics. */
 size_t krtsp_mosaic_columns(
     int canvas_width, int canvas_height, size_t count, float aspect);
+
+/* ---------------------------- history buffer ---------------------------- */
+
+/*
+ * A rolling on-disk buffer behind a live view: the same ffmpeg session that
+ * feeds the picture also writes -c copy segments, and the oldest are
+ * deleted as the newest arrive, so the disk holds "the last N" and no more.
+ *
+ * Size is what the user chooses, and the default is chosen for the disk it
+ * lands on.  A fixed default is wrong twice: on a small system disk it eats
+ * what the machine needs, and on a large one it throws away history nobody
+ * asked to lose.  So the default is a tenth of what is free, bounded on
+ * both sides, and never any of the space that has to stay free.
+ */
+typedef enum krtsp_buffer_kind {
+    KRTSP_BUFFER_AUTO = 0,   /* sized from the disk */
+    KRTSP_BUFFER_OFF,        /* no buffer, no history */
+    KRTSP_BUFFER_BYTES,      /* at most this many bytes */
+    KRTSP_BUFFER_SECONDS     /* at most this much history */
+} krtsp_buffer_kind;
+
+typedef struct krtsp_buffer_spec {
+    krtsp_buffer_kind kind;
+    uint64_t amount;         /* bytes or seconds; zero for AUTO and OFF */
+} krtsp_buffer_spec;
+
+/*
+ * Parse what a person types: "auto", "off", a size ("500M", "2G", "1.5GiB")
+ * or a duration ("90s", "10min", "2h").  A size or a duration must carry
+ * its unit; a bare number and a lone "m" are refused, because "10m" is
+ * ten minutes to one reader and ten megabytes to another and a buffer
+ * sized by a guess is a disk filled by one.
+ */
+bool krtsp_buffer_parse(const char *text, krtsp_buffer_spec *out);
+
+/*
+ * The limits a spec resolves to on a disk with `free_bytes` of `total_bytes`
+ * available.  `reserve_bytes` is what is never touched: the larger of 2 GiB
+ * and 5% of the disk.  `clamped` says an explicit request was cut to fit.
+ */
+typedef struct krtsp_buffer_plan {
+    bool enabled;
+    uint64_t max_bytes;      /* the disk ceiling; always set when enabled */
+    uint64_t max_seconds;    /* zero means bounded by bytes alone */
+    uint64_t reserve_bytes;
+    bool clamped;
+} krtsp_buffer_plan;
+
+void krtsp_buffer_plan_make(
+    const krtsp_buffer_spec *spec, uint64_t free_bytes, uint64_t total_bytes,
+    krtsp_buffer_plan *plan);
+
+/* Free and total bytes of the filesystem holding `path`. */
+bool krtsp_buffer_disk(const char *path, uint64_t *free_bytes,
+                       uint64_t *total_bytes);
+
+/* "1.5 GB", "42 MB": for status lines. */
+void krtsp_buffer_format_bytes(uint64_t bytes, char *out, size_t capacity);
+
+#define KRTSP_SEGMENT_NAME_MAX 96
+
+/* One recorded segment, named by the strftime pattern the recorder uses. */
+typedef struct krtsp_segment {
+    char name[KRTSP_SEGMENT_NAME_MAX];
+    time_t start;
+    uint64_t bytes;
+} krtsp_segment;
+
+/*
+ * The segments in `dir`, oldest first.  Anything not named like a segment
+ * is ignored - the recorder's own bookkeeping lives beside them - and the
+ * newest entry may still be being written.  Returns how many were stored,
+ * at most `capacity`; when there are more the newest are kept.
+ */
+size_t krtsp_segments_scan(const char *dir, krtsp_segment *out,
+                           size_t capacity);
+
+/*
+ * Delete the oldest segments until the plan holds: total bytes within
+ * max_bytes and, when set, nothing older than max_seconds before `now`.
+ * The newest `keep_newest` segments are never deleted, whatever they weigh:
+ * the one being written and the one before it are the live edge.  Returns
+ * how many were removed.
+ */
+size_t krtsp_segments_prune(
+    const char *dir, const krtsp_buffer_plan *plan, time_t now,
+    size_t keep_newest);
+
+/*
+ * Which segment holds `target`, and how far into it.  A target before the
+ * oldest segment lands at the start of the oldest and returns false, so a
+ * caller can say "that is further back than there is".  Returns false with
+ * *index untouched when there are no segments.
+ */
+bool krtsp_segments_locate(
+    const krtsp_segment *segments, size_t count, time_t target,
+    size_t *index, int *offset_seconds);
+
+/*
+ * This process's buffer directory for a camera, created under the cache
+ * directory as <label>.<pid> so two views of one camera never share a
+ * segment set.  The label is reduced to [A-Za-z0-9._-].
+ */
+bool krtsp_buffer_dir_make(const char *label, char *out, size_t capacity);
+
+/* Delete a directory made above and its segments; a no-op on NULL. */
+void krtsp_buffer_dir_remove(const char *dir);
+
+/* Remove buffer directories left by processes that no longer exist. */
+size_t krtsp_buffer_sweep(void);
 
 #ifdef __cplusplus
 }
