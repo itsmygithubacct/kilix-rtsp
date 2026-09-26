@@ -40,6 +40,15 @@ expect_status 2 "config needs value" "$binary" list --config
 expect_status 2 "list rejects target" "$binary" list one
 expect_status 2 "probe rejects view option" "$binary" probe --fps 10 \
     rtsp://example.invalid/live
+expect_status 2 "buffer rejects the ambiguous 10m" "$binary" view \
+    --buffer 10m rtsp://example.invalid/live
+expect_status 2 "buffer rejects a bare number" "$binary" view --buffer 10 \
+    rtsp://example.invalid/live
+expect_status 2 "buffer needs a value" "$binary" view rtsp://example.invalid/live \
+    --buffer
+expect_status 2 "buffer applies to view only" "$binary" list --buffer 2G
+expect_status 2 "detect applies to view only" "$binary" probe --detect \
+    rtsp://example.invalid/live
 expect_status 2 "mosaic rejects tier" "$binary" mosaic --tier main
 expect_status 2 "mosaic rejects seventeenth target" "$binary" mosaic \
     a b c d e f g h i j k l m n o p q

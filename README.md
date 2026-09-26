@@ -53,7 +53,8 @@ stderr, so the output pipes cleanly. `mosaic` with no argument shows every
 configured camera.
 
 Options: `--tier main|sub`, `--fps <n>`, `--config <path>`, and `--tab` to open
-a view in a new terminal tab. `--fps` applies to views and mosaics. Options are
+a view in a new terminal tab. `view` also takes `--buffer` and `--detect`,
+described below. `--fps` applies to views and mosaics. Options are
 command-specific: an option a command would ignore is rejected, as are malformed
 numbers, extra targets, and mosaics larger than 16 cameras. `q` or escape quits.
 
@@ -77,6 +78,69 @@ canvas persists between composites, so each one redraws only the tiles that
 changed and tells the presenter exactly which regions those were; the presenter
 patches the on-screen image rather than retransmitting the canvas, falling back
 to a full frame by itself whenever patching cannot help.
+
+## History and detection in a view
+
+A `view` keeps a rolling history behind the live picture and can draw object
+detections over it. Both are driven from the keyboard, and a small strip of
+help appears at the foot of the picture for a few seconds after any key or
+click.
+
+| Key | Does |
+| --- | --- |
+| Left / Right | 10 seconds back / forward |
+| Shift+Left / Shift+Right, PgUp / PgDn | 60 seconds back / forward |
+| Home | the oldest moment in the buffer |
+| End | back to live |
+| Space | pause and resume (a pause holds the frame; resuming carries on from it) |
+| `d`, or click the button | object detection on / off |
+| `?` or `h` | keep the help strip up |
+| `q`, Esc | quit |
+
+Replay runs at the speed it was recorded and keeps its distance from live:
+watch from three minutes back and you are still three minutes back a minute
+later. Stepping forward into the last two seconds returns to live.
+
+### The buffer
+
+The history rides on the same ffmpeg session as the picture: the camera sees
+one client, and the segments are the camera's own bitstream copied to disk
+(`-c copy`, ten seconds each), never re-encoded. They live under
+`cache/buffer/<camera>.<pid>/` and are deleted as they age out and when the
+view quits; directories left by a process that was killed are swept at the
+next start.
+
+`--buffer` takes `auto` (the default), `off`, a size (`500M`, `2G`, `1.5GiB`)
+or a duration (`90s`, `10min`, `2h`). A size or a duration must carry its
+unit; a bare number and a lowercase `m` are refused, because `10m` means ten
+minutes to one reader and ten megabytes to another. The same value can be set
+with `KILIX_RTSP_BUFFER` or `buffer = 2G` in `config/settings.conf`, and the
+command line wins over the environment, which wins over the file.
+
+The default is sized for the disk it lands on: a tenth of the free space,
+never less than 256 MiB nor more than 8 GiB, and never any of the space that
+has to stay free (the larger of 2 GiB and 5% of the disk). An explicit size is
+held to the same limit and cut to fit, with a duration also capped by the
+disk. Below 64 MiB of usable room there is no history and the view says so
+when a history key is pressed. An ordinary file is its own history and is
+never buffered.
+
+### Detection
+
+The button, or `d`, starts the detector named by `KILIX_OBJECT_DETECTOR`,
+else the YOLOX runtime `kilix install yolox` sets up, else the YOLO one, and
+draws its boxes and labels over the picture, live or replayed. With none
+installed the view says `kilix yolox install`; a variable naming a path that
+no longer exists is ignored in favour of what is installed.
+
+The detector is a subprocess speaking the pipe contract kilix-look uses: one
+square of BGRA in (the frame fitted and centred, each output pixel the average
+of what it covers), `float32[20][6]` out of `[class, score, y0, x0, y1, x1]`
+normalised to that square. kilix-rtsp implements the client itself because
+kilix-object-detect carries kilix-rtsp as a submodule, not the other way
+round. It runs on a worker thread, at most about five frames a second, so a
+model that takes a minute to load never stops the picture; boxes older than
+two and a half seconds are dropped rather than left where something used to be.
 
 ## Sharing one decode
 

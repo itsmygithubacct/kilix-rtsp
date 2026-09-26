@@ -36,12 +36,21 @@ static void usage(FILE *stream)
         "                           main for view)\n"
         "  --fps <n>                cap the delivered frame rate (view)\n"
         "  --tab                    open the view in a new kilix tab\n"
+        "  --buffer <size|time|off> history kept behind the live view (view):\n"
+        "                           auto (default), off, 2G, 500M, 90s, 10min\n"
+        "  --detect                 start the view with object detection on\n"
         "  --config <path>          config file (default\n"
         "                           <state>/config/cameras.conf)\n"
         "\n"
         "Configuration and data live under ~/.local/gpu_terminal/kilix-rtsp,\n"
         "overridable with KILIX_RTSP_HOME.  The ffmpeg binary can be\n"
-        "overridden with KILIX_RTSP_FFMPEG.\n");
+        "overridden with KILIX_RTSP_FFMPEG.\n"
+        "\n"
+        "In a view: Left/Right step 10s through the history, Shift or\n"
+        "PgUp/PgDn 60s, Home the oldest, End back to live, Space pause,\n"
+        "d object detection, ? help, q quit.  The default buffer is sized\n"
+        "from free disk; set KILIX_RTSP_BUFFER or `buffer = 2G` in\n"
+        "<state>/config/settings.conf to change it.\n");
 }
 
 static bool parse_nonnegative_int(const char *text, int *out)
@@ -377,18 +386,99 @@ static int command_mosaic(
     return result;
 }
 
+/*
+ * The default history size: the settings file, then the environment, then
+ * what --buffer said.  A value that does not parse is reported and ignored
+ * rather than trusted: a buffer sized by a guess is a disk filled by one.
+ */
+static void buffer_from_text(const char *origin, const char *text,
+                             krtsp_buffer_spec *spec)
+{
+    krtsp_buffer_spec parsed;
+
+    if (krtsp_buffer_parse(text, &parsed)) {
+        *spec = parsed;
+        return;
+    }
+    (void)fprintf(stderr,
+                  "kilix-rtsp: %s: cannot read buffer size '%s' (try 2G, "
+                  "500M, 90s, 10min, auto or off)\n", origin, text);
+}
+
+static void buffer_from_settings_file(krtsp_buffer_spec *spec)
+{
+    char directory[PATH_MAX];
+    char path[PATH_MAX + 16];
+    char line[256];
+    FILE *file;
+
+    if (!krtsp_paths_dir("config", directory, sizeof(directory)) ||
+        snprintf(path, sizeof(path), "%s/settings.conf", directory) >=
+            (int)sizeof(path)) {
+        return;
+    }
+    file = fopen(path, "r");
+    if (file == NULL) {
+        return;
+    }
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char *equals = strchr(line, '=');
+        char *key = line;
+        char *value;
+        char *end;
+
+        if (equals == NULL || line[0] == '#') {
+            continue;
+        }
+        *equals = '\0';
+        value = equals + 1;
+        while (*key == ' ' || *key == '\t') {
+            ++key;
+        }
+        end = key + strlen(key);
+        while (end > key && (end[-1] == ' ' || end[-1] == '\t')) {
+            *--end = '\0';
+        }
+        while (*value == ' ' || *value == '\t') {
+            ++value;
+        }
+        end = value + strlen(value);
+        while (end > value && (end[-1] == ' ' || end[-1] == '\t' ||
+                               end[-1] == '\n' || end[-1] == '\r')) {
+            *--end = '\0';
+        }
+        if (strcmp(key, "buffer") == 0) {
+            buffer_from_text("settings.conf", value, spec);
+        }
+    }
+    (void)fclose(file);
+}
+
 static int command_view(const char *target, krtsp_tier tier,
-                        const char *config_path, int fps_cap)
+                        const char *config_path, int fps_cap,
+                        const char *buffer_text, bool detect)
 {
     krtsp_config *config = NULL;
     const char *url = NULL;
     const char *label = NULL;
+    krtsp_view_options options;
+    const char *environment = getenv("KILIX_RTSP_BUFFER");
     int result;
 
     if (!resolve_target(target, tier, config_path, &config, &url, &label)) {
         return 2;
     }
-    result = krtsp_view_run(url, label, fps_cap);
+    (void)memset(&options, 0, sizeof(options));
+    options.fps_cap = fps_cap;
+    options.detect = detect;
+    buffer_from_settings_file(&options.buffer);
+    if (environment != NULL && environment[0] != '\0') {
+        buffer_from_text("KILIX_RTSP_BUFFER", environment, &options.buffer);
+    }
+    if (buffer_text != NULL) {
+        buffer_from_text("--buffer", buffer_text, &options.buffer);
+    }
+    result = krtsp_view_run(url, label, &options);
     krtsp_config_free(config);
     return result;
 }
@@ -497,6 +587,8 @@ int main(int argc, char **argv)
     bool want_tab = false;
     bool fps_given = false;
     int fps_cap = 0;
+    const char *buffer_text = NULL;
+    bool detect = false;
     char *positional[16];
     int positional_count = 0;
 
@@ -554,6 +646,16 @@ int main(int argc, char **argv)
             }
             index++;
             fps_given = true;
+        } else if (strcmp(argv[index], "--buffer") == 0) {
+            if (index + 1 >= argc) {
+                (void)fprintf(stderr,
+                              "kilix-rtsp: --buffer needs a size, a time, "
+                              "auto or off\n");
+                return 2;
+            }
+            buffer_text = argv[++index];
+        } else if (strcmp(argv[index], "--detect") == 0) {
+            detect = true;
         } else if (argv[index][0] == '-') {
             (void)fprintf(stderr, "kilix-rtsp: unknown option %s\n",
                           argv[index]);
@@ -569,6 +671,25 @@ int main(int argc, char **argv)
                 return 2;
             }
             positional[positional_count++] = argv[index];
+        }
+    }
+
+    if (strcmp(command, "view") != 0 && (buffer_text != NULL || detect)) {
+        (void)fprintf(stderr,
+                      "kilix-rtsp: --buffer and --detect apply to view only\n");
+        return 2;
+    }
+    if (buffer_text != NULL) {
+        /* Refuse a malformed size before opening a tab or a terminal, where
+         * the message would vanish with the window. */
+        krtsp_buffer_spec check;
+
+        if (!krtsp_buffer_parse(buffer_text, &check)) {
+            (void)fprintf(stderr,
+                          "kilix-rtsp: --buffer '%s' is not a size or a time "
+                          "(try 2G, 500M, 90s, 10min, auto or off)\n",
+                          buffer_text);
+            return 2;
         }
     }
 
@@ -625,7 +746,8 @@ int main(int argc, char **argv)
                 }
             }
         }
-        return command_view(target, tier, config_path, fps_cap);
+        return command_view(target, tier, config_path, fps_cap, buffer_text,
+                            detect);
     }
     if (strcmp(command, "mosaic") == 0) {
         if (tier_given || want_tab) {
