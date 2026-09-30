@@ -299,6 +299,14 @@ ending it, so it can be attached again later. A detached view has nobody to show
 frames to, so it stops its stream and starts a new one on reattach. Outside such
 a terminal there is nothing to detect and the view always streams.
 
+If nobody reattaches within 30 seconds, the view exits and its session ends.
+A detached view is not worth keeping: reopening the camera starts a fresh one,
+while a lingering one is re-attached by every later kilix start into a hidden
+"recovered:" tab, where it counts as watched and decodes again. Left alone,
+copies pile up: a camera desk that reopened its view daily reached 29 copies of
+one stream. `KILIX_RTSP_DETACHED_EXIT_SECONDS` sets the grace; `0` keeps a
+detached view waiting for ever.
+
 ## License
 
 MIT. See `LICENSE`. The pinned dependencies retain their own notices.

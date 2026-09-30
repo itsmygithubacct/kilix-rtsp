@@ -199,3 +199,32 @@ bool krtsp_attach_is_attached(krtsp_attach *watch)
     }
     return status.attached != 0;
 }
+
+/*
+ * How long a view may stay detached before it exits.
+ *
+ * A camera view that nobody is attached to is not a paused session worth
+ * keeping: reopening the camera starts a fresh view in a second, while a
+ * detached one lingers as a broker session that every later kilix start
+ * re-attaches into a hidden "recovered:" tab - where it counts as watched
+ * and decodes again.  On a camera desk that reopened its view daily, 29
+ * copies of one stream piled up that way (2026-09-30).  So after a short
+ * grace, which rides out a frontend restart, a detached view ends.
+ * KILIX_RTSP_DETACHED_EXIT_SECONDS overrides the grace; 0 keeps the old
+ * behaviour of waiting to be reattached for ever.
+ */
+long long krtsp_attach_detached_exit_ms(void)
+{
+    const char *value = getenv("KILIX_RTSP_DETACHED_EXIT_SECONDS");
+    char *end = NULL;
+    long seconds;
+
+    if (value == NULL || value[0] == '\0') {
+        return 30000;
+    }
+    seconds = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || seconds < 0 || seconds > 86400) {
+        return 30000;
+    }
+    return (long long)seconds * 1000;
+}
