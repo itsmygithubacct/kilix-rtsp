@@ -816,6 +816,8 @@ int krtsp_view_run(const char *url, const char *label,
     krtsp_attach attach;
     bool streaming = true;
     long long attach_checked_at = 0;
+    long long detached_since = 0;
+    const long long detached_limit = krtsp_attach_detached_exit_ms();
     uint8_t *present_buffer = NULL;
     uint64_t last_sequence = UINT64_MAX;
     uint64_t last_replay_sequence = UINT64_MAX;
@@ -949,6 +951,16 @@ int krtsp_view_run(const char *url, const char *label,
             bool attached = krtsp_attach_is_attached(&attach);
 
             attach_checked_at = now_ms;
+            if (attached) {
+                detached_since = 0;
+            } else if (detached_since == 0) {
+                detached_since = now_ms;
+            } else if (detached_limit > 0 &&
+                       now_ms - detached_since >= detached_limit) {
+                /* Nobody came back: end the view and its broker session. */
+                exit_code = 0;
+                break;
+            }
             if (!attached && streaming) {
                 krtsp_source_stop(source);
                 source = NULL;
@@ -1463,6 +1475,8 @@ int krtsp_mosaic_run(
     krtsp_compositor compositor = {0};
     uint8_t *present_buffer = NULL;
     long long attach_checked_at = 0;
+    long long detached_since = 0;
+    const long long detached_limit = krtsp_attach_detached_exit_ms();
     long long resize_pending_at = 0;
     long long composed_at = 0;
     bool streaming = true;
@@ -1529,6 +1543,15 @@ int krtsp_mosaic_run(
             bool attached = krtsp_attach_is_attached(&attach);
 
             attach_checked_at = monotonic_ms();
+            if (attached) {
+                detached_since = 0;
+            } else if (detached_since == 0) {
+                detached_since = attach_checked_at;
+            } else if (detached_limit > 0 &&
+                       attach_checked_at - detached_since >= detached_limit) {
+                exit_code = 0;
+                break;
+            }
             if (!attached && streaming) {
                 mosaic_stop_sources(slots, count);
                 streaming = false;

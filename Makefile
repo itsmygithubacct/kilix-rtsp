@@ -86,7 +86,8 @@ TESTS := \
 	$(BUILD_DIR)/test-compose \
 	$(BUILD_DIR)/test-buffer \
 	$(BUILD_DIR)/test-history \
-	$(BUILD_DIR)/test-detect
+	$(BUILD_DIR)/test-detect \
+	$(BUILD_DIR)/test-attach
 
 FAKE_FFMPEG := $(BUILD_DIR)/fake-ffmpeg
 FAKE_DETECTOR := $(BUILD_DIR)/fake-detector
@@ -146,6 +147,14 @@ $(FAKE_DETECTOR): tests/fake_detector.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/test-%: tests/test_%.c $(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -Isrc $< $(STATIC_LIB) \
+		$(LDLIBS) -o $@
+
+# The attach module lives with the view, not in the library; link it
+# with the broker client it calls.
+$(BUILD_DIR)/test-attach: tests/test_attach.c $(BUILD_DIR)/krtsp_attach.o \
+		$(BUILD_DIR)/vendor/kitty_pty_broker.o | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -Isrc $< \
+		$(BUILD_DIR)/krtsp_attach.o $(BUILD_DIR)/vendor/kitty_pty_broker.o \
 		$(LDLIBS) -o $@
 
 $(BUILD_DIR)/test-probe: tests/test_probe.c $(BUILD_DIR)/krtsp_probe.o \
