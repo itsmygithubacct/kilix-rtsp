@@ -154,11 +154,11 @@ other processes attach to:
 
 ```c
 krtsp_frame *ring;
-krtsp_frame_init_shared(&ring, "sample-side", 640, 360, /* max_readers */ 4);
+krtsp_frame_init_shared(&ring, "sample-camera", 640, 360, /* max_readers */ 4);
 
 /* elsewhere, in another process */
 krtsp_frame *reader;
-krtsp_frame_attach(&reader, "sample-side");
+krtsp_frame_attach(&reader, "sample-camera");
 ```
 
 Readers get the same borrow/release contract as an in-process consumer. The ring
@@ -189,7 +189,7 @@ some cameras refuse a second concurrent session:
 
 ```c
 options.roles = KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD;
-options.record_dir = "/srv/video/sample-side";
+options.record_dir = "/srv/video/sample-camera";
 ```
 
 `roles` is a bitmask because all three combinations are real. `KRTSP_ROLE_RECORD`

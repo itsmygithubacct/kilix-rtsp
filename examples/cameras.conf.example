@@ -36,13 +36,13 @@ main = rtsp://USER:PASSWORD@192.0.2.11:554/live/ch0
 sub  = rtsp://USER:PASSWORD@192.0.2.11:554/live/ch1
 
 # Non-standard port, and a path convention unlike either of the above.
-[camera "sample-indoor"]
+[camera "sample-camera"]
 main = rtsp://USER:PASSWORD@192.0.2.12:10554/tcp/av0_0
 sub  = rtsp://USER:PASSWORD@192.0.2.12:10554/tcp/av0_1
 
 # Named groups for `kilix-rtsp mosaic <group>`.
 [group "all"]
-cameras = front, side, sample-indoor
+cameras = front, side, sample-camera
 
 [group "outside"]
 cameras = front, side

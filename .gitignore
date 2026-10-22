@@ -1,1 +1,10 @@
 /build/
+
+# Local camera settings and captured media belong under ~/.local/.
+/cameras.conf
+/config/
+/recordings/
+/snapshots/
+*.local.conf
+.env
+.env.*

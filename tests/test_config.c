@@ -86,12 +86,12 @@ test_parses_cameras_and_groups(void)
         "main = rtsp://u:p@203.0.113.10:554/stream1\n"
         "sub  = rtsp://u:p@203.0.113.10:554/stream2\n"
         "\n"
-        "[camera \"sample-indoor\"]\n"
+        "[camera \"sample-camera\"]\n"
         "main = rtsp://u:p@203.0.113.12:10554/tcp/av0_0\n"
         "sub  = rtsp://u:p@203.0.113.12:10554/tcp/av0_1\n"
         "\n"
         "[group \"all\"]\n"
-        "cameras = front, sample-indoor\n", 0600));
+        "cameras = front, sample-camera\n", 0600));
 
     CHECK(krtsp_config_load(&config, temp_path("good.conf"), error,
                             sizeof(error)));
@@ -107,7 +107,7 @@ test_parses_cameras_and_groups(void)
 
     /* A non-standard port and a third path convention must survive
      * verbatim: nothing here derives one tier's URL from another's. */
-    camera = krtsp_config_find(config, "sample-indoor");
+    camera = krtsp_config_find(config, "sample-camera");
     CHECK(camera != NULL);
     CHECK(strstr(krtsp_camera_url(camera, KRTSP_TIER_SUB), ":10554/") != NULL);
 
@@ -115,7 +115,7 @@ test_parses_cameras_and_groups(void)
     CHECK(group != NULL);
     CHECK(group->member_count == 2u);
     CHECK(strcmp(group->members[0], "front") == 0);
-    CHECK(strcmp(group->members[1], "sample-indoor") == 0);
+    CHECK(strcmp(group->members[1], "sample-camera") == 0);
 
     CHECK(krtsp_config_find(config, "nope") == NULL);
     CHECK(krtsp_config_find_group(config, "nope") == NULL);
