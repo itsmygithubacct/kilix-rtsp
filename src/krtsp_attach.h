@@ -23,4 +23,8 @@ void krtsp_attach_init(krtsp_attach *watch);
 /* True when a frontend is attached, or when there is no broker to ask. */
 bool krtsp_attach_is_attached(krtsp_attach *watch);
 
+/* Milliseconds a view may stay detached before it exits (default 30 s;
+ * KILIX_RTSP_DETACHED_EXIT_SECONDS overrides, 0 = never exit). */
+long long krtsp_attach_detached_exit_ms(void);
+
 #endif
