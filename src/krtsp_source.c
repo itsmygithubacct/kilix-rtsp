@@ -121,6 +121,7 @@ void krtsp_source_options_init(krtsp_source_options *options)
     options->pixfmt = KRTSP_PIXFMT_RGBA;
     options->low_latency = true;
     options->realtime = true;
+    options->seek_seconds = 0;
     options->letterbox = false;
     options->stall_ms = 20000;
     options->grace_ms = 15000;

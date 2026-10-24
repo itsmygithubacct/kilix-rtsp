@@ -50,6 +50,7 @@ void krtsp_args_request_init(krtsp_args_request *request)
     request->low_latency = true;
     /* A local file behaves like a camera unless told otherwise. */
     request->realtime = true;
+    request->seek_seconds = 0;
     request->letterbox = false;
     request->pixfmt = KRTSP_PIXFMT_RGBA;
     request->legacy_timeout_flag = false;

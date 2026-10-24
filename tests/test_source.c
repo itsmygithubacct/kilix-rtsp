@@ -731,6 +731,32 @@ test_overall_status_takes_the_worse_role(void)
     return true;
 }
 
+static bool test_default_local_source_does_not_seek(void)
+{
+    krtsp_source_options options;
+    krtsp_source *source = NULL;
+    char directory[256];
+    char argv_log[512];
+    bool received, sought;
+
+    CHECK(make_record_dir(directory, sizeof(directory), "default-seek"));
+    CHECK(snprintf(argv_log, sizeof(argv_log), "%s/argv.log", directory) > 0);
+    configure_fake("frames", 100, 20);
+    (void)setenv("FAKE_FFMPEG_ARGV_LOG", argv_log, 1);
+    /* A positive old value reproduces the accidental far-future file seek. */
+    options.seek_seconds = 3600;
+    base_options(&options);
+    CHECK(krtsp_source_start(&source, "/tmp/synthetic-recording.mkv", &options));
+    received = wait_for_frames(source, 3u, 2000);
+    krtsp_source_stop(source);
+    sought = file_contains(argv_log, "-ss");
+    (void)unsetenv("FAKE_FFMPEG_ARGV_LOG");
+    remove_tree(directory);
+    CHECK(received);
+    CHECK(!sought);
+    return true;
+}
+
 typedef bool (*test_function)(void);
 
 typedef struct test_case {
@@ -742,6 +768,7 @@ int
 main(void)
 {
     static const test_case tests[] = {
+        {"default local source does not seek", test_default_local_source_does_not_seek},
         {"frames arrive", test_frames_arrive},
         {"child exit restarts", test_child_exit_restarts},
         {"wedged camera is detected", test_wedged_camera_is_detected},

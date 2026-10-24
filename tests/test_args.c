@@ -119,6 +119,8 @@ test_a_local_file_is_not_given_rtsp_options(void)
     krtsp_args_request request;
     size_t count;
 
+    /* Reusing a request must not seek the next file to an earlier offset. */
+    request.seek_seconds = 3600;
     krtsp_args_request_init(&request);
     request.url = "/srv/footage/yesterday.mkv";
     count = krtsp_build_argv(&request, argv, KRTSP_ARGV_MAX, storage,
@@ -130,6 +132,7 @@ test_a_local_file_is_not_given_rtsp_options(void)
     CHECK(!has_arg(count, "-user_agent"));
     /* Paced by default, so the ring sees it at the rate it was shot. */
     CHECK(has_arg(count, "-re"));
+    CHECK(!has_arg(count, "-ss"));
     /* Everything that is not RTSP-specific still applies. */
     CHECK(has_pair(count, "-fflags", "+genpts+discardcorrupt"));
     CHECK(has_pair(count, "-avoid_negative_ts", "make_zero"));
